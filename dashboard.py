@@ -7,8 +7,10 @@ import sqlite3
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from datetime import datetime
+from urllib.parse import urlparse, parse_qs
 
 DB_PATH = Path.home() / ".claude" / "usage.db"
+PROJECTS_DIR = Path.home() / ".claude" / "projects"
 
 
 def get_dashboard_data(db_path=DB_PATH):
@@ -71,7 +73,8 @@ def get_dashboard_data(db_path=DB_PATH):
         except Exception:
             duration_min = 0
         sessions_all.append({
-            "session_id":    r["session_id"][:8],
+            "session_id":    r["session_id"],
+            "session_short": r["session_id"][:8],
             "project":       r["project_name"] or "unknown",
             "last":          (r["last_timestamp"] or "")[:16].replace("T", " "),
             "last_date":     (r["last_timestamp"] or "")[:10],
@@ -91,6 +94,181 @@ def get_dashboard_data(db_path=DB_PATH):
         "daily_by_model": daily_by_model,
         "sessions_all":   sessions_all,
         "generated_at":   datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def extract_text(value):
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        parts = []
+        for item in value:
+            text = extract_text(item)
+            if text:
+                parts.append(text)
+        return "\n".join(parts).strip()
+    if isinstance(value, dict):
+        item_type = value.get("type")
+        if item_type in {"text", "input_text", "output_text"}:
+            return str(value.get("text", "")).strip()
+        if item_type in {"tool_use", "server_tool_use"}:
+            name = value.get("name") or "tool"
+            payload = value.get("input")
+            payload_text = ""
+            if payload not in (None, "", {}, []):
+                try:
+                    payload_text = json.dumps(payload, ensure_ascii=False)
+                except TypeError:
+                    payload_text = str(payload)
+            return f"[tool_use] {name}" + (f" {payload_text}" if payload_text else "")
+        if item_type in {"tool_result", "server_tool_result"}:
+            content = extract_text(value.get("content"))
+            return f"[tool_result] {content}".strip()
+        for key in ("text", "content", "message"):
+            if key in value:
+                text = extract_text(value.get(key))
+                if text:
+                    return text
+        return ""
+    return str(value).strip()
+
+
+def find_session_file(session_id, projects_dir=PROJECTS_DIR):
+    for path in projects_dir.glob("**/*.jsonl"):
+        if path.stem == session_id:
+            return path
+
+    candidate = None
+    for path in projects_dir.glob("**/*.jsonl"):
+        try:
+            with path.open(encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if session_id in line:
+                        candidate = path
+                        break
+        except OSError:
+            continue
+        if candidate:
+            break
+    return candidate
+
+
+def get_session_detail(session_id, projects_dir=PROJECTS_DIR):
+    path = find_session_file(session_id, projects_dir=projects_dir)
+    if not path:
+        return {"error": f"Session not found for id {session_id}"}
+
+    messages = []
+    session_meta = {
+        "session_id": session_id,
+        "session_short": session_id[:8],
+        "project": "unknown",
+        "git_branch": "",
+        "source_file": str(path),
+        "first_timestamp": "",
+        "last_timestamp": "",
+    }
+
+    first_user_message = ""
+    assistant_count = 0
+
+    try:
+        with path.open(encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                if record.get("sessionId") != session_id:
+                    continue
+
+                timestamp = record.get("timestamp", "")
+                cwd = record.get("cwd", "")
+                git_branch = record.get("gitBranch", "")
+                if cwd:
+                    parts = cwd.replace("\\", "/").rstrip("/").split("/")
+                    session_meta["project"] = "/".join(parts[-2:]) if len(parts) >= 2 else (parts[-1] if parts else "unknown")
+                if git_branch and not session_meta["git_branch"]:
+                    session_meta["git_branch"] = git_branch
+                if timestamp:
+                    if not session_meta["first_timestamp"] or timestamp < session_meta["first_timestamp"]:
+                        session_meta["first_timestamp"] = timestamp
+                    if not session_meta["last_timestamp"] or timestamp > session_meta["last_timestamp"]:
+                        session_meta["last_timestamp"] = timestamp
+
+                rtype = record.get("type")
+                if rtype not in {"user", "assistant"}:
+                    continue
+
+                content = extract_text(
+                    record.get("message", {}).get("content") if rtype == "assistant" else record.get("message")
+                )
+                if not content:
+                    continue
+
+                usage = record.get("message", {}).get("usage", {}) if rtype == "assistant" else {}
+                if rtype == "user" and not first_user_message:
+                    first_user_message = content.replace("\n", " ").strip()
+                if rtype == "assistant":
+                    assistant_count += 1
+                messages.append({
+                    "role": rtype,
+                    "timestamp": timestamp,
+                    "model": record.get("message", {}).get("model", "") if rtype == "assistant" else "",
+                    "input_tokens": usage.get("input_tokens", 0) or 0,
+                    "output_tokens": usage.get("output_tokens", 0) or 0,
+                    "cache_read_tokens": usage.get("cache_read_input_tokens", 0) or 0,
+                    "cache_creation_tokens": usage.get("cache_creation_input_tokens", 0) or 0,
+                    "content": content,
+                })
+    except OSError as e:
+        return {"error": f"Could not read session file: {e}"}
+
+    if not messages:
+        return {"error": f"No readable transcript content found for session {session_id}"}
+
+    return {
+        "session": session_meta,
+        "summary": {
+            "message_count": len(messages),
+            "assistant_count": assistant_count,
+            "first_user_excerpt": (first_user_message[:180] + "…") if len(first_user_message) > 180 else first_user_message,
+        },
+        "messages": messages,
+    }
+
+
+def get_session_preview(session_id, projects_dir=PROJECTS_DIR):
+    detail = get_session_detail(session_id, projects_dir=projects_dir)
+    if detail.get("error"):
+        return detail
+
+    meta = detail["session"]
+    summary = detail.get("summary", {})
+    messages = detail.get("messages", [])
+
+    assistant_messages = [msg for msg in messages if msg.get("role") == "assistant"]
+    primary_model = next((msg.get("model") for msg in assistant_messages if msg.get("model")), "unknown")
+    total_input = sum(msg.get("input_tokens", 0) or 0 for msg in assistant_messages)
+    total_output = sum(msg.get("output_tokens", 0) or 0 for msg in assistant_messages)
+
+    return {
+        "session_id": session_id,
+        "session_short": meta.get("session_short", session_id[:8]),
+        "project": meta.get("project", "unknown"),
+        "first_timestamp": meta.get("first_timestamp", ""),
+        "last_timestamp": meta.get("last_timestamp", ""),
+        "model": primary_model,
+        "message_count": summary.get("message_count", len(messages)),
+        "assistant_count": summary.get("assistant_count", len(assistant_messages)),
+        "first_user_excerpt": summary.get("first_user_excerpt", ""),
+        "token_total": total_input + total_output,
     }
 
 
@@ -161,6 +339,58 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .muted { color: var(--muted); }
   .section-title { font-size: 13px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 12px; }
   .table-card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 20px; margin-bottom: 24px; overflow-x: auto; }
+  .sessions-table tbody tr { cursor: pointer; }
+  .sessions-table tbody tr.active td { background: rgba(217,119,87,0.1); }
+  .session-link { display: flex; flex-direction: column; gap: 2px; }
+  .session-link-id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--text); }
+  .session-link-meta { color: var(--muted); font-size: 11px; }
+  .session-row-hover { position: relative; }
+  .session-hover-card { position: absolute; left: 18px; top: calc(100% + 8px); width: min(420px, 72vw); padding: 14px; border-radius: 14px; background: rgba(17,20,28,0.98); border: 1px solid rgba(255,255,255,0.08); box-shadow: 0 18px 40px rgba(0,0,0,0.38); z-index: 40; pointer-events: none; }
+  .session-hover-kicker { color: var(--accent); font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 8px; }
+  .session-hover-title { color: var(--text); font-size: 14px; font-weight: 600; line-height: 1.5; margin-bottom: 10px; }
+  .session-hover-meta { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+  .session-hover-pill { display: inline-flex; padding: 4px 8px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); font-size: 10px; background: rgba(255,255,255,0.03); }
+  .session-hover-body { color: var(--muted); font-size: 12px; line-height: 1.6; }
+  .session-modal-backdrop { position: fixed; inset: 0; background: rgba(8,10,14,0.72); backdrop-filter: blur(6px); display: none; align-items: center; justify-content: center; padding: 24px; z-index: 1000; }
+  .session-modal-backdrop.open { display: flex; }
+  .session-modal { width: min(1040px, 100%); max-height: min(88vh, 920px); overflow: hidden; background: linear-gradient(180deg, rgba(30,33,43,0.98), rgba(20,23,31,0.98)); border: 1px solid rgba(255,255,255,0.08); border-radius: 18px; box-shadow: 0 30px 90px rgba(0,0,0,0.45); display: flex; flex-direction: column; }
+  .session-modal-header { padding: 18px 22px 14px; border-bottom: 1px solid var(--border); display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+  .session-modal-title { font-size: 18px; font-weight: 700; }
+  .session-modal-subtitle { color: var(--muted); margin-top: 4px; }
+  .session-modal-controls { display: flex; align-items: center; gap: 10px; }
+  .session-detail-close { border: 1px solid var(--border); background: transparent; color: var(--muted); border-radius: 8px; padding: 7px 11px; cursor: pointer; }
+  .session-detail-close:hover { border-color: var(--accent); color: var(--text); }
+  .session-modal-body { overflow: auto; padding: 20px 22px 24px; }
+  .session-hero { margin-bottom: 18px; padding: 18px 20px; border-radius: 16px; background: linear-gradient(135deg, rgba(217,119,87,0.18), rgba(79,142,247,0.08)); border: 1px solid rgba(255,255,255,0.08); }
+  .session-kicker { color: var(--accent); font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 8px; }
+  .session-hero-title { font-size: 22px; line-height: 1.3; font-weight: 700; color: var(--text); }
+  .session-hero-text { margin-top: 10px; color: var(--muted); line-height: 1.7; max-width: 78ch; }
+  .session-overview { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 18px; }
+  .session-overview-card { background: rgba(255,255,255,0.03); border: 1px solid var(--border); border-radius: 14px; padding: 14px 15px; }
+  .session-overview-label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 6px; }
+  .session-overview-value { color: var(--text); font-size: 15px; font-weight: 600; line-height: 1.4; }
+  .session-overview-sub { color: var(--muted); font-size: 11px; margin-top: 4px; line-height: 1.5; }
+  .session-summary { display: grid; grid-template-columns: 1.2fr 1fr; gap: 16px; margin-bottom: 18px; }
+  .session-summary-card { background: rgba(255,255,255,0.03); border: 1px solid var(--border); border-radius: 14px; padding: 16px; }
+  .session-summary-label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 8px; }
+  .session-summary-text { line-height: 1.6; color: var(--text); }
+  .session-detail-meta { display: flex; flex-wrap: wrap; gap: 8px; }
+  .session-detail-pill { display: inline-flex; align-items: center; gap: 6px; padding: 5px 10px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); font-size: 11px; background: rgba(255,255,255,0.03); }
+  .transcript-section-title { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 10px; }
+  .session-detail-empty { color: var(--muted); line-height: 1.6; padding: 20px; }
+  .session-detail-error { color: #f87171; padding: 20px; }
+  .message-list { display: flex; flex-direction: column; gap: 14px; }
+  .message-card { border-radius: 16px; padding: 14px 16px; max-width: 88%; }
+  .message-card.user { align-self: flex-start; background: rgba(79,142,247,0.12); border: 1px solid rgba(79,142,247,0.28); }
+  .message-card.assistant { align-self: flex-end; background: rgba(217,119,87,0.12); border: 1px solid rgba(217,119,87,0.28); }
+  .message-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+  .message-role { font-size: 11px; letter-spacing: 0.05em; text-transform: uppercase; color: var(--muted); }
+  .message-meta { color: var(--muted); font-size: 11px; text-align: right; }
+  .message-body { white-space: pre-wrap; line-height: 1.7; word-break: break-word; font-size: 13px; }
+  .message-activity-group { display: flex; flex-direction: column; gap: 8px; align-items: center; }
+  .message-activity { width: min(720px, 100%); background: rgba(255,255,255,0.03); border: 1px dashed var(--border); border-radius: 12px; padding: 10px 12px; }
+  .message-activity-label { color: var(--accent); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 6px; }
+  .message-activity-body { color: var(--muted); line-height: 1.6; white-space: pre-wrap; word-break: break-word; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
 
   footer { border-top: 1px solid var(--border); padding: 20px 24px; margin-top: 8px; }
   .footer-content { max-width: 1400px; margin: 0 auto; }
@@ -169,7 +399,15 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .footer-content a { color: var(--blue); text-decoration: none; }
   .footer-content a:hover { text-decoration: underline; }
 
-  @media (max-width: 768px) { .charts-grid { grid-template-columns: 1fr; } .chart-card.wide { grid-column: 1; } }
+  @media (max-width: 768px) {
+    .charts-grid { grid-template-columns: 1fr; }
+    .chart-card.wide { grid-column: 1; }
+    .session-overview { grid-template-columns: 1fr 1fr; }
+    .session-summary { grid-template-columns: 1fr; }
+    .session-modal-backdrop { padding: 12px; }
+    .session-modal { max-height: 94vh; border-radius: 14px; }
+    .message-card { max-width: 100%; }
+  }
 </style>
 </head>
 <body>
@@ -211,7 +449,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   </div>
   <div class="table-card">
     <div class="section-title">Recent Sessions</div>
-    <table>
+    <table class="sessions-table">
       <thead><tr>
         <th>Session</th><th>Project</th><th>Last Active</th><th>Duration</th>
         <th>Model</th><th>Turns</th><th>Input</th><th>Output</th><th>Est. Cost</th>
@@ -228,6 +466,23 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       </tr></thead>
       <tbody id="model-cost-body"></tbody>
     </table>
+  </div>
+</div>
+
+<div id="session-modal-backdrop" class="session-modal-backdrop" onclick="onSessionModalBackdrop(event)">
+  <div class="session-modal" role="dialog" aria-modal="true" aria-labelledby="session-modal-title">
+    <div class="session-modal-header">
+      <div>
+        <div id="session-modal-title" class="session-modal-title">Session Context</div>
+        <div id="session-modal-subtitle" class="session-modal-subtitle">Open a session from the table to inspect its transcript.</div>
+      </div>
+      <div class="session-modal-controls">
+        <button class="session-detail-close" onclick="closeSessionDetail()">Close</button>
+      </div>
+    </div>
+    <div id="session-detail" class="session-modal-body">
+      <div class="session-detail-empty">Click a session row to inspect the transcript context from its source `.jsonl` file.</div>
+    </div>
   </div>
 </div>
 
@@ -249,6 +504,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 let rawData = null;
 let selectedModels = new Set();
 let selectedRange = '30d';
+let activeSessionId = null;
+let hoverPreviewSessionId = null;
+let hoverPreviewData = null;
+let hoverPreviewTimer = null;
+let previewCache = new Map();
+let visibleSessions = [];
 let charts = {};
 
 // ── Pricing (Anthropic API, April 2026) ────────────────────────────────────
@@ -328,6 +589,10 @@ function readURLRange() {
   return ['7d', '30d', '90d', 'all'].includes(p) ? p : '30d';
 }
 
+function readURLSession() {
+  return new URLSearchParams(window.location.search).get('session') || null;
+}
+
 function setRange(range) {
   selectedRange = range;
   document.querySelectorAll('.range-btn').forEach(btn =>
@@ -403,6 +668,7 @@ function updateURL() {
   const params = new URLSearchParams();
   if (selectedRange !== '30d') params.set('range', selectedRange);
   if (!isDefaultModelSelection(allModels)) params.set('models', Array.from(selectedModels).join(','));
+  if (activeSessionId) params.set('session', activeSessionId);
   const search = params.toString() ? '?' + params.toString() : '';
   history.replaceState(null, '', window.location.pathname + search);
 }
@@ -477,13 +743,19 @@ function applyFilter() {
 
   // Update daily chart title
   document.getElementById('daily-chart-title').textContent = 'Daily Token Usage \u2014 ' + RANGE_LABELS[selectedRange];
+  visibleSessions = filteredSessions.slice(0, 20);
 
   renderStats(totals);
   renderDailyChart(daily);
   renderModelChart(byModel);
   renderProjectChart(byProject);
-  renderSessionsTable(filteredSessions.slice(0, 20));
+  renderSessionsTable(visibleSessions);
   renderModelCostTable(byModel);
+}
+
+function rerenderSessionsOnly() {
+  if (!rawData) return;
+  renderSessionsTable(visibleSessions);
 }
 
 // ── Renderers ──────────────────────────────────────────────────────────────
@@ -583,8 +855,16 @@ function renderSessionsTable(sessions) {
     const costCell = isBillable(s.model)
       ? `<td class="cost">${fmtCost(cost)}</td>`
       : `<td class="cost-na">n/a</td>`;
-    return `<tr>
-      <td class="muted" style="font-family:monospace">${s.session_id}&hellip;</td>
+    const isActive = s.session_id === activeSessionId;
+    const showPreview = hoverPreviewSessionId === s.session_id;
+    return `<tr class="session-row-hover ${isActive ? 'active' : ''}" onclick="openSessionDetail('${s.session_id}')" onmouseenter="scheduleSessionPreview('${s.session_id}')" onmouseleave="hideSessionPreview()">
+      <td>
+        <div class="session-link">
+          <div class="session-link-id">${s.session_short}&hellip;</div>
+          <div class="session-link-meta">Open transcript</div>
+          ${showPreview ? renderSessionHoverCard() : ''}
+        </div>
+      </td>
       <td>${s.project}</td>
       <td class="muted">${s.last}</td>
       <td class="muted">${s.duration_min}m</td>
@@ -595,6 +875,236 @@ function renderSessionsTable(sessions) {
       ${costCell}
     </tr>`;
   }).join('');
+}
+
+function escapeHTML(value) {
+  return String(value ?? '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;');
+}
+
+function renderSessionHoverCard() {
+  if (!hoverPreviewSessionId) return '';
+  if (!hoverPreviewData) {
+    return `<div class="session-hover-card">
+      <div class="session-hover-kicker">Session Preview</div>
+      <div class="session-hover-body">Loading summary…</div>
+    </div>`;
+  }
+  if (hoverPreviewData.error) {
+    return `<div class="session-hover-card">
+      <div class="session-hover-kicker">Session Preview</div>
+      <div class="session-hover-body">${escapeHTML(hoverPreviewData.error)}</div>
+    </div>`;
+  }
+  const preview = hoverPreviewData;
+  const pills = [
+    preview.project ? `Project ${preview.project}` : '',
+    preview.model ? `Model ${preview.model}` : '',
+    preview.message_count ? `${preview.message_count} messages` : '',
+    preview.token_total ? `${fmt(preview.token_total)} tokens` : '',
+  ].filter(Boolean).map(item => `<div class="session-hover-pill">${escapeHTML(item)}</div>`).join('');
+  return `<div class="session-hover-card">
+    <div class="session-hover-kicker">Session Preview</div>
+    <div class="session-hover-title">${escapeHTML(preview.first_user_excerpt || `Session ${preview.session_short}…`)}</div>
+    <div class="session-hover-meta">${pills}</div>
+    <div class="session-hover-body">Hover to scan intent. Click to open the full transcript.</div>
+  </div>`;
+}
+
+function scheduleSessionPreview(sessionId) {
+  clearTimeout(hoverPreviewTimer);
+  hoverPreviewSessionId = sessionId;
+  hoverPreviewData = previewCache.get(sessionId) || null;
+  rerenderSessionsOnly();
+  if (previewCache.has(sessionId)) return;
+  hoverPreviewTimer = setTimeout(() => loadSessionPreview(sessionId), 180);
+}
+
+function hideSessionPreview() {
+  clearTimeout(hoverPreviewTimer);
+  hoverPreviewSessionId = null;
+  hoverPreviewData = null;
+  rerenderSessionsOnly();
+}
+
+async function loadSessionPreview(sessionId) {
+  if (previewCache.has(sessionId)) {
+    hoverPreviewData = previewCache.get(sessionId);
+    rerenderSessionsOnly();
+    return;
+  }
+  try {
+    const resp = await fetch('/api/session_preview?session_id=' + encodeURIComponent(sessionId));
+    const data = await resp.json();
+    previewCache.set(sessionId, data);
+    if (hoverPreviewSessionId === sessionId) {
+      hoverPreviewData = data;
+      rerenderSessionsOnly();
+    }
+  } catch (e) {
+    const errorData = { error: 'Failed to load summary.' };
+    previewCache.set(sessionId, errorData);
+    if (hoverPreviewSessionId === sessionId) {
+      hoverPreviewData = errorData;
+      rerenderSessionsOnly();
+    }
+  }
+}
+
+function renderSessionDetailLoading() {
+  document.getElementById('session-modal-title').textContent = 'Session Context';
+  document.getElementById('session-modal-subtitle').textContent = 'Loading transcript…';
+  document.getElementById('session-detail').innerHTML = '<div class="session-detail-empty">Loading session context…</div>';
+  document.getElementById('session-modal-backdrop').classList.add('open');
+  document.body.style.overflow = 'hidden';
+}
+
+function renderSessionDetailError(message) {
+  document.getElementById('session-modal-title').textContent = 'Session Context';
+  document.getElementById('session-modal-subtitle').textContent = 'There was a problem loading this transcript.';
+  document.getElementById('session-detail').innerHTML = `<div class="session-detail-error">${escapeHTML(message)}</div>`;
+  document.getElementById('session-modal-backdrop').classList.add('open');
+  document.body.style.overflow = 'hidden';
+}
+
+function closeSessionDetail() {
+  activeSessionId = null;
+  updateURL();
+  applyFilter();
+  document.getElementById('session-modal-backdrop').classList.remove('open');
+  document.body.style.overflow = '';
+  document.getElementById('session-modal-title').textContent = 'Session Context';
+  document.getElementById('session-modal-subtitle').textContent = 'Open a session from the table to inspect its transcript.';
+  document.getElementById('session-detail').innerHTML = '<div class="session-detail-empty">Click a session row to inspect the transcript context from its source `.jsonl` file.</div>';
+}
+
+function onSessionModalBackdrop(event) {
+  if (event.target.id === 'session-modal-backdrop') closeSessionDetail();
+}
+
+function humanizeActivity(text) {
+  if (text.startsWith('[tool_use]')) return { label: 'Tool Call', body: text.replace('[tool_use]', '').trim() };
+  if (text.startsWith('[tool_result]')) return { label: 'Tool Result', body: text.replace('[tool_result]', '').trim() };
+  return null;
+}
+
+function summarizeSessionTitle(summary, meta) {
+  const text = (summary.first_user_excerpt || '').trim();
+  if (!text) return meta.project || `Session ${meta.session_short}`;
+  return text.length > 72 ? text.slice(0, 72).trimEnd() + '…' : text;
+}
+
+function formatSessionDate(value) {
+  if (!value) return 'Unknown';
+  return value.replace('T', ' ').replace('Z', '').slice(0, 16);
+}
+
+function renderSessionDetail(data) {
+  const meta = data.session;
+  const summary = data.summary || {};
+  const sessionTitle = summarizeSessionTitle(summary, meta);
+  const messageHTML = data.messages.map(msg => {
+    const activity = humanizeActivity(msg.content);
+    const tokenParts = [];
+    if (msg.role === 'assistant') {
+      tokenParts.push(`in ${fmt(msg.input_tokens)}`);
+      tokenParts.push(`out ${fmt(msg.output_tokens)}`);
+      if (msg.cache_read_tokens) tokenParts.push(`cache read ${fmt(msg.cache_read_tokens)}`);
+      if (msg.cache_creation_tokens) tokenParts.push(`cache write ${fmt(msg.cache_creation_tokens)}`);
+    }
+    if (activity) {
+      return `<div class="message-activity-group">
+        <div class="message-activity">
+          <div class="message-activity-label">${escapeHTML(activity.label)}</div>
+          <div class="message-activity-body">${escapeHTML(activity.body)}</div>
+        </div>
+      </div>`;
+    }
+    return `<div class="message-card ${msg.role}">
+      <div class="message-head">
+        <div class="message-role">${msg.role}${msg.model ? ' · ' + escapeHTML(msg.model) : ''}</div>
+        <div class="message-meta">${escapeHTML((msg.timestamp || '').replace('T', ' ').slice(0, 19))}${tokenParts.length ? ' · ' + escapeHTML(tokenParts.join(' · ')) : ''}</div>
+      </div>
+      <div class="message-body">${escapeHTML(msg.content)}</div>
+    </div>`;
+  }).join('');
+
+  const metaPills = [
+    meta.project ? `Project: ${meta.project}` : '',
+    meta.git_branch ? `Branch: ${meta.git_branch}` : '',
+    summary.message_count ? `Messages: ${summary.message_count}` : '',
+    summary.assistant_count ? `Assistant replies: ${summary.assistant_count}` : '',
+    meta.source_file ? `File: ${meta.source_file}` : '',
+  ].filter(Boolean).map(item => `<div class="session-detail-pill">${escapeHTML(item)}</div>`).join('');
+
+  const assistantMessages = data.messages.filter(msg => msg.role === 'assistant');
+  const primaryModel = assistantMessages.find(msg => msg.model)?.model || 'unknown';
+  const totalInput = assistantMessages.reduce((sum, msg) => sum + (msg.input_tokens || 0), 0);
+  const totalOutput = assistantMessages.reduce((sum, msg) => sum + (msg.output_tokens || 0), 0);
+  const totalCacheRead = assistantMessages.reduce((sum, msg) => sum + (msg.cache_read_tokens || 0), 0);
+  const totalCacheCreation = assistantMessages.reduce((sum, msg) => sum + (msg.cache_creation_tokens || 0), 0);
+  const estimatedCost = isBillable(primaryModel)
+    ? fmtCost(calcCost(primaryModel, totalInput, totalOutput, totalCacheRead, totalCacheCreation))
+    : 'n/a';
+  const overviewCards = [
+    { label: 'Project', value: meta.project || 'Unknown', sub: meta.git_branch ? `Branch ${meta.git_branch}` : 'No branch captured' },
+    { label: 'Timeline', value: formatSessionDate(meta.last_timestamp), sub: `Started ${formatSessionDate(meta.first_timestamp)}` },
+    { label: 'Model', value: primaryModel, sub: `${summary.assistant_count || 0} assistant replies` },
+    { label: 'Usage', value: `${fmt(totalInput + totalOutput)} tokens`, sub: `Cost ${estimatedCost}` },
+  ].map(card => `
+    <div class="session-overview-card">
+      <div class="session-overview-label">${escapeHTML(card.label)}</div>
+      <div class="session-overview-value">${escapeHTML(card.value)}</div>
+      <div class="session-overview-sub">${escapeHTML(card.sub)}</div>
+    </div>
+  `).join('');
+
+  document.getElementById('session-modal-title').textContent = sessionTitle;
+  document.getElementById('session-modal-subtitle').textContent = `Session ${meta.session_short}…`;
+  document.getElementById('session-detail').innerHTML = `
+    <div class="session-hero">
+      <div class="session-kicker">Conversation Focus</div>
+      <div class="session-hero-title">${escapeHTML(sessionTitle)}</div>
+      <div class="session-hero-text">${summary.first_user_excerpt ? escapeHTML(summary.first_user_excerpt) : 'No user prompt text available for this session.'}</div>
+    </div>
+    <div class="session-overview">${overviewCards}</div>
+    <div class="session-summary">
+      <div class="session-summary-card">
+        <div class="session-summary-label">Session Metadata</div>
+        <div class="session-detail-meta">${metaPills}</div>
+      </div>
+      <div class="session-summary-card">
+        <div class="session-summary-label">Reading Note</div>
+        <div class="session-summary-text">User and assistant messages are shown as the main conversation. Tool calls and tool results are separated so the session reads more like a narrative than a raw log.</div>
+      </div>
+    </div>
+    <div class="transcript-section-title">Transcript</div>
+    <div class="message-list">${messageHTML}</div>
+  `;
+  document.getElementById('session-modal-backdrop').classList.add('open');
+  document.body.style.overflow = 'hidden';
+}
+
+async function openSessionDetail(sessionId) {
+  activeSessionId = sessionId;
+  updateURL();
+  applyFilter();
+  renderSessionDetailLoading();
+  try {
+    const resp = await fetch('/api/session?session_id=' + encodeURIComponent(sessionId));
+    const data = await resp.json();
+    if (data.error) {
+      renderSessionDetailError(data.error);
+      return;
+    }
+    renderSessionDetail(data);
+  } catch (e) {
+    console.error(e);
+    renderSessionDetailError('Failed to load session context.');
+  }
 }
 
 function renderModelCostTable(byModel) {
@@ -632,6 +1142,7 @@ async function loadData() {
     if (isFirstLoad) {
       // Restore range from URL, mark active button
       selectedRange = readURLRange();
+      activeSessionId = readURLSession();
       document.querySelectorAll('.range-btn').forEach(btn =>
         btn.classList.toggle('active', btn.dataset.range === selectedRange)
       );
@@ -640,6 +1151,7 @@ async function loadData() {
     }
 
     applyFilter();
+    if (isFirstLoad && activeSessionId) openSessionDetail(activeSessionId);
   } catch(e) {
     console.error(e);
   }
@@ -647,6 +1159,9 @@ async function loadData() {
 
 loadData();
 setInterval(loadData, 30000);
+document.addEventListener('keydown', event => {
+  if (event.key === 'Escape' && activeSessionId) closeSessionDetail();
+});
 </script>
 </body>
 </html>
@@ -658,16 +1173,44 @@ class DashboardHandler(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
-        if self.path in ("/", "/index.html"):
+        parsed = urlparse(self.path)
+
+        if parsed.path in ("/", "/index.html"):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
             self.wfile.write(HTML_TEMPLATE.encode("utf-8"))
 
-        elif self.path == "/api/data":
+        elif parsed.path == "/api/data":
             data = get_dashboard_data()
             body = json.dumps(data).encode("utf-8")
             self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        elif parsed.path == "/api/session":
+            session_id = parse_qs(parsed.query).get("session_id", [""])[0].strip()
+            if not session_id:
+                body = json.dumps({"error": "Missing session_id"}).encode("utf-8")
+                self.send_response(400)
+            else:
+                body = json.dumps(get_session_detail(session_id)).encode("utf-8")
+                self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        elif parsed.path == "/api/session_preview":
+            session_id = parse_qs(parsed.query).get("session_id", [""])[0].strip()
+            if not session_id:
+                body = json.dumps({"error": "Missing session_id"}).encode("utf-8")
+                self.send_response(400)
+            else:
+                body = json.dumps(get_session_preview(session_id)).encode("utf-8")
+                self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
