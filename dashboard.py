@@ -20,6 +20,15 @@ def get_dashboard_data(db_path=DB_PATH):
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
 
+    # ── All accounts (for filter UI) ─────────────────────────────────────────
+    account_rows = conn.execute("""
+        SELECT COALESCE(account, 'default') as account
+        FROM sessions
+        GROUP BY account
+        ORDER BY account
+    """).fetchall()
+    all_accounts = [r["account"] for r in account_rows]
+
     # ── All models (for filter UI) ────────────────────────────────────────────
     model_rows = conn.execute("""
         SELECT COALESCE(model, 'unknown') as model
@@ -29,24 +38,26 @@ def get_dashboard_data(db_path=DB_PATH):
     """).fetchall()
     all_models = [r["model"] for r in model_rows]
 
-    # ── Daily per-model, ALL history (client filters by range) ────────────────
+    # ── Daily per-model+account, ALL history (client filters by range) ────────
     daily_rows = conn.execute("""
         SELECT
-            substr(timestamp, 1, 10)   as day,
-            COALESCE(model, 'unknown') as model,
-            SUM(input_tokens)          as input,
-            SUM(output_tokens)         as output,
-            SUM(cache_read_tokens)     as cache_read,
-            SUM(cache_creation_tokens) as cache_creation,
-            COUNT(*)                   as turns
+            substr(timestamp, 1, 10)        as day,
+            COALESCE(model, 'unknown')      as model,
+            COALESCE(account, 'default')    as account,
+            SUM(input_tokens)               as input,
+            SUM(output_tokens)              as output,
+            SUM(cache_read_tokens)          as cache_read,
+            SUM(cache_creation_tokens)      as cache_creation,
+            COUNT(*)                        as turns
         FROM turns
-        GROUP BY day, model
-        ORDER BY day, model
+        GROUP BY day, model, account
+        ORDER BY day, model, account
     """).fetchall()
 
     daily_by_model = [{
         "day":            r["day"],
         "model":          r["model"],
+        "account":        r["account"],
         "input":          r["input"] or 0,
         "output":         r["output"] or 0,
         "cache_read":     r["cache_read"] or 0,
@@ -54,12 +65,13 @@ def get_dashboard_data(db_path=DB_PATH):
         "turns":          r["turns"] or 0,
     } for r in daily_rows]
 
-    # ── All sessions (client filters by range and model) ──────────────────────
+    # ── All sessions (client filters by range, model, account) ───────────────
     session_rows = conn.execute("""
         SELECT
             session_id, project_name, first_timestamp, last_timestamp,
             total_input_tokens, total_output_tokens,
-            total_cache_read, total_cache_creation, model, turn_count
+            total_cache_read, total_cache_creation, model, turn_count,
+            COALESCE(account, 'default') as account
         FROM sessions
         ORDER BY last_timestamp DESC
     """).fetchall()
@@ -80,6 +92,7 @@ def get_dashboard_data(db_path=DB_PATH):
             "last_date":     (r["last_timestamp"] or "")[:10],
             "duration_min":  duration_min,
             "model":         r["model"] or "unknown",
+            "account":       r["account"],
             "turns":         r["turn_count"] or 0,
             "input":         r["total_input_tokens"] or 0,
             "output":        r["total_output_tokens"] or 0,
@@ -90,6 +103,7 @@ def get_dashboard_data(db_path=DB_PATH):
     conn.close()
 
     return {
+        "all_accounts":   all_accounts,
         "all_models":     all_models,
         "daily_by_model": daily_by_model,
         "sessions_all":   sessions_all,
@@ -293,52 +307,81 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 14px; }
 
-  header { background: var(--card); border-bottom: 1px solid var(--border); padding: 16px 24px; display: flex; align-items: center; justify-content: space-between; }
-  header h1 { font-size: 18px; font-weight: 600; color: var(--accent); }
-  header .meta { color: var(--muted); font-size: 12px; }
+  /* ── Header ── */
+  header { background: var(--card); border-bottom: 1px solid var(--border); padding: 0 24px; height: 52px; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+  header h1 { font-size: 15px; font-weight: 600; color: var(--text); display: flex; align-items: center; gap: 10px; }
+  header h1::before { content: ''; display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 3px rgba(217,119,87,0.2); flex-shrink: 0; }
+  header .meta { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 
-  #filter-bar { background: var(--card); border-bottom: 1px solid var(--border); padding: 10px 24px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-  .filter-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); white-space: nowrap; }
-  .filter-sep { width: 1px; height: 22px; background: var(--border); flex-shrink: 0; }
-  #model-checkboxes { display: flex; flex-wrap: wrap; gap: 6px; }
-  .model-cb-label { display: flex; align-items: center; gap: 5px; padding: 3px 10px; border-radius: 20px; border: 1px solid var(--border); cursor: pointer; font-size: 12px; color: var(--muted); transition: border-color 0.15s, color 0.15s, background 0.15s; user-select: none; }
+  /* ── Unified top bar: profile tabs (left) + filter controls (right) ── */
+  #top-bar { background: var(--card); border-bottom: 1px solid var(--border); display: flex; align-items: stretch; padding: 0 24px; min-height: 40px; overflow-x: auto; scrollbar-width: none; }
+  #top-bar::-webkit-scrollbar { display: none; }
+  #profile-tabs { display: flex; align-items: stretch; flex-shrink: 0; }
+  #filter-controls { margin-left: auto; display: flex; align-items: center; gap: 8px; flex-shrink: 0; padding-left: 16px; border-left: 1px solid var(--border); }
+
+  /* Profile tabs */
+  .profile-tab { display: inline-flex; align-items: center; gap: 6px; padding: 0 16px; height: 40px; border: none; border-bottom: 2px solid transparent; background: transparent; color: var(--muted); font-size: 12px; font-weight: 500; letter-spacing: 0.01em; cursor: pointer; white-space: nowrap; transition: color 0.12s, border-color 0.12s; user-select: none; flex-shrink: 0; }
+  .profile-tab:hover { color: var(--text); background: rgba(255,255,255,0.03); }
+  .profile-tab.active { color: var(--profile-color, var(--accent)); border-bottom-color: var(--profile-color, var(--accent)); font-weight: 600; }
+  .profile-tab.active .profile-dot { box-shadow: 0 0 0 2px var(--card), 0 0 0 3px var(--profile-color, var(--accent)); }
+  .profile-tab-all { display: inline-flex; align-items: center; padding: 0 16px; height: 40px; border: none; border-bottom: 2px solid transparent; background: transparent; color: var(--muted); font-size: 12px; font-weight: 500; cursor: pointer; white-space: nowrap; transition: color 0.12s, border-color 0.12s; flex-shrink: 0; }
+  .profile-tab-all:hover { color: var(--text); background: rgba(255,255,255,0.03); }
+  .profile-tab-all.active { color: var(--text); border-bottom-color: rgba(255,255,255,0.3); font-weight: 600; }
+  .profile-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; transition: box-shadow 0.15s; }
+  .profile-divider { width: 1px; background: var(--border); margin: 10px 4px; flex-shrink: 0; }
+
+  /* Filter controls */
+  .filter-sep { width: 1px; height: 20px; background: var(--border); flex-shrink: 0; }
+  #model-checkboxes { display: flex; flex-wrap: nowrap; gap: 5px; }
+  .model-cb-label { display: flex; align-items: center; gap: 4px; padding: 2px 9px; border-radius: 20px; border: 1px solid var(--border); cursor: pointer; font-size: 11px; color: var(--muted); transition: border-color 0.15s, color 0.15s, background 0.15s; user-select: none; white-space: nowrap; }
   .model-cb-label:hover { border-color: var(--accent); color: var(--text); }
   .model-cb-label.checked { background: rgba(217,119,87,0.12); border-color: var(--accent); color: var(--text); }
   .model-cb-label input { display: none; }
-  .filter-btn { padding: 3px 10px; border-radius: 4px; border: 1px solid var(--border); background: transparent; color: var(--muted); font-size: 11px; cursor: pointer; white-space: nowrap; }
+  .filter-btn { padding: 2px 8px; border-radius: 4px; border: 1px solid var(--border); background: transparent; color: var(--muted); font-size: 11px; cursor: pointer; white-space: nowrap; }
   .filter-btn:hover { border-color: var(--accent); color: var(--text); }
-  .range-group { display: flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; flex-shrink: 0; }
-  .range-btn { padding: 4px 13px; background: transparent; border: none; border-right: 1px solid var(--border); color: var(--muted); font-size: 12px; cursor: pointer; transition: background 0.15s, color 0.15s; }
+  .range-group { display: flex; border: 1px solid var(--border); border-radius: 5px; overflow: hidden; flex-shrink: 0; }
+  .range-btn { padding: 3px 11px; background: transparent; border: none; border-right: 1px solid var(--border); color: var(--muted); font-size: 11px; cursor: pointer; transition: background 0.15s, color 0.15s; }
   .range-btn:last-child { border-right: none; }
   .range-btn:hover { background: rgba(255,255,255,0.04); color: var(--text); }
   .range-btn.active { background: rgba(217,119,87,0.15); color: var(--accent); font-weight: 600; }
 
+  /* ── Stats row ── */
   .container { max-width: 1400px; margin: 0 auto; padding: 24px; }
-  .stats-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 16px; margin-bottom: 24px; }
-  .stat-card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
-  .stat-card .label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 6px; }
-  .stat-card .value { font-size: 22px; font-weight: 700; }
-  .stat-card .sub { color: var(--muted); font-size: 11px; margin-top: 4px; }
+  .stats-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 24px; }
+  .stat-card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; position: relative; overflow: hidden; transition: border-color 0.15s; }
+  .stat-card:hover { border-color: rgba(255,255,255,0.1); }
+  .stat-card::before { content: ''; position: absolute; left: 0; top: 12px; bottom: 12px; width: 2px; border-radius: 0 2px 2px 0; background: var(--stat-accent, var(--border)); }
+  .stat-card .label { color: var(--muted); font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 8px; }
+  .stat-card .value { font-size: 20px; font-weight: 700; line-height: 1; font-variant-numeric: tabular-nums; color: var(--stat-color, var(--text)); }
+  .stat-card .sub { color: var(--muted); font-size: 10px; margin-top: 5px; line-height: 1.4; }
+  .stat-card.stat-primary { border-color: rgba(74,222,128,0.2); background: linear-gradient(135deg, rgba(74,222,128,0.06) 0%, var(--card) 60%); --stat-accent: var(--green); --stat-color: var(--green); }
+  .stat-card.stat-tokens { --stat-accent: var(--blue); }
+  .stat-card.stat-cache { --stat-accent: rgba(251,191,36,0.6); }
 
-  .charts-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 24px; }
+  /* ── Charts ── */
+  .charts-grid { display: grid; grid-template-columns: 1.6fr 1fr; gap: 16px; margin-bottom: 24px; }
   .chart-card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 20px; }
   .chart-card.wide { grid-column: 1 / -1; }
-  .chart-card h2 { font-size: 13px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 16px; }
+  .chart-card h2 { font-size: 11px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 16px; }
   .chart-wrap { position: relative; height: 240px; }
   .chart-wrap.tall { height: 300px; }
 
+  /* ── Tables ── */
+  .table-card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 20px; margin-bottom: 24px; overflow: hidden; }
+  .table-scroll { overflow-x: auto; }
   table { width: 100%; border-collapse: collapse; }
-  th { text-align: left; padding: 8px 12px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); border-bottom: 1px solid var(--border); }
+  thead { position: sticky; top: 0; z-index: 2; }
+  th { background: var(--card); text-align: left; padding: 8px 12px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); border-bottom: 1px solid var(--border); }
   td { padding: 10px 12px; border-bottom: 1px solid var(--border); font-size: 13px; }
   tr:last-child td { border-bottom: none; }
   tr:hover td { background: rgba(255,255,255,0.02); }
   .model-tag { display: inline-block; padding: 2px 7px; border-radius: 4px; font-size: 11px; background: rgba(79,142,247,0.15); color: var(--blue); }
+  .account-tag { display: inline-block; padding: 2px 7px; border-radius: 4px; font-size: 11px; font-weight: 600; }
   .cost { color: var(--green); font-family: monospace; }
   .cost-na { color: var(--muted); font-family: monospace; font-size: 11px; }
   .num { font-family: monospace; }
   .muted { color: var(--muted); }
-  .section-title { font-size: 13px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 12px; }
-  .table-card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 20px; margin-bottom: 24px; overflow-x: auto; }
+  .section-title { font-size: 11px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; padding-bottom: 10px; border-bottom: 1px solid var(--border); margin-bottom: 0; }
   .sessions-table tbody tr { cursor: pointer; }
   .sessions-table tbody tr.active td { background: rgba(217,119,87,0.1); }
   .session-link { display: flex; flex-direction: column; gap: 2px; }
@@ -402,6 +445,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   @media (max-width: 768px) {
     .charts-grid { grid-template-columns: 1fr; }
     .chart-card.wide { grid-column: 1; }
+    #top-bar { flex-wrap: wrap; }
+    #filter-controls { margin-left: 0; border-left: none; padding-left: 0; border-top: 1px solid var(--border); width: 100%; padding: 6px 0; flex-wrap: wrap; }
     .session-overview { grid-template-columns: 1fr 1fr; }
     .session-summary { grid-template-columns: 1fr; }
     .session-modal-backdrop { padding: 12px; }
@@ -412,22 +457,23 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 </head>
 <body>
 <header>
-  <h1>Claude Code Usage Dashboard</h1>
+  <h1>Claude Code Usage</h1>
   <div class="meta" id="meta">Loading...</div>
 </header>
 
-<div id="filter-bar">
-  <div class="filter-label">Models</div>
-  <div id="model-checkboxes"></div>
-  <button class="filter-btn" onclick="selectAllModels()">All</button>
-  <button class="filter-btn" onclick="clearAllModels()">None</button>
-  <div class="filter-sep"></div>
-  <div class="filter-label">Range</div>
-  <div class="range-group">
-    <button class="range-btn" data-range="7d"  onclick="setRange('7d')">7d</button>
-    <button class="range-btn" data-range="30d" onclick="setRange('30d')">30d</button>
-    <button class="range-btn" data-range="90d" onclick="setRange('90d')">90d</button>
-    <button class="range-btn" data-range="all" onclick="setRange('all')">All</button>
+<div id="top-bar">
+  <div id="profile-tabs" role="tablist" aria-label="Account profile"></div>
+  <div id="filter-controls">
+    <div id="model-checkboxes"></div>
+    <button class="filter-btn" onclick="selectAllModels()">All</button>
+    <button class="filter-btn" onclick="clearAllModels()">None</button>
+    <div class="filter-sep"></div>
+    <div class="range-group">
+      <button class="range-btn" data-range="7d"  onclick="setRange('7d')">7d</button>
+      <button class="range-btn" data-range="30d" onclick="setRange('30d')">30d</button>
+      <button class="range-btn" data-range="90d" onclick="setRange('90d')">90d</button>
+      <button class="range-btn" data-range="all" onclick="setRange('all')">All</button>
+    </div>
   </div>
 </div>
 
@@ -449,23 +495,27 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   </div>
   <div class="table-card">
     <div class="section-title">Recent Sessions</div>
-    <table class="sessions-table">
-      <thead><tr>
-        <th>Session</th><th>Project</th><th>Last Active</th><th>Duration</th>
-        <th>Model</th><th>Turns</th><th>Input</th><th>Output</th><th>Est. Cost</th>
-      </tr></thead>
-      <tbody id="sessions-body"></tbody>
-    </table>
+    <div class="table-scroll">
+      <table class="sessions-table">
+        <thead><tr>
+          <th>Session</th><th>Project</th><th>Account</th><th>Last Active</th><th>Duration</th>
+          <th>Model</th><th>Turns</th><th>Input</th><th>Output</th><th>Est. Cost</th>
+        </tr></thead>
+        <tbody id="sessions-body"></tbody>
+      </table>
+    </div>
   </div>
   <div class="table-card">
     <div class="section-title">Cost by Model</div>
-    <table>
-      <thead><tr>
-        <th>Model</th><th>Turns</th><th>Input</th><th>Output</th>
-        <th>Cache Read</th><th>Cache Creation</th><th>Est. Cost</th>
-      </tr></thead>
-      <tbody id="model-cost-body"></tbody>
-    </table>
+    <div class="table-scroll">
+      <table>
+        <thead><tr>
+          <th>Model</th><th>Turns</th><th>Input</th><th>Output</th>
+          <th>Cache Read</th><th>Cache Creation</th><th>Est. Cost</th>
+        </tr></thead>
+        <tbody id="model-cost-body"></tbody>
+      </table>
+    </div>
   </div>
 </div>
 
@@ -503,6 +553,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 // ── State ──────────────────────────────────────────────────────────────────
 let rawData = null;
 let selectedModels = new Set();
+let selectedAccounts = new Set();
 let selectedRange = '30d';
 let activeSessionId = null;
 let hoverPreviewSessionId = null;
@@ -562,6 +613,23 @@ function fmt(n) {
 }
 function fmtCost(c)    { return '$' + c.toFixed(4); }
 function fmtCostBig(c) { return '$' + c.toFixed(2); }
+
+// ── Account / Profile colors ───────────────────────────────────────────────
+const ACCT_PALETTE = ['#d97757','#4f8ef7','#4ade80','#a78bfa','#fbbf24','#f472b6'];
+const _acctColorMap = {};
+function accountColor(account) {
+  const key = account || 'default';
+  if (!_acctColorMap[key]) {
+    const keys = Object.keys(_acctColorMap);
+    _acctColorMap[key] = ACCT_PALETTE[keys.length % ACCT_PALETTE.length];
+  }
+  return _acctColorMap[key];
+}
+
+// Pre-seed color map in insertion order so colors stay stable
+function seedAccountColors(allAccounts) {
+  allAccounts.forEach(a => accountColor(a));
+}
 
 // ── Chart colors ───────────────────────────────────────────────────────────
 const TOKEN_COLORS = {
@@ -624,6 +692,60 @@ function isDefaultModelSelection(allModels) {
   return billable.every(m => selectedModels.has(m));
 }
 
+// ── Profile selector (single-account radio-style) ──────────────────────────
+// selectedAccounts is a Set, but profile bar drives it as a single selection
+// 'null' means "All profiles"
+let selectedProfile = null; // null = all, string = one account
+
+function buildProfileUI(allAccounts) {
+  seedAccountColors(allAccounts);
+  selectedAccounts = new Set(allAccounts);
+  selectedProfile = null;
+
+  const container = document.getElementById('profile-tabs');
+  const allTab = `<button class="profile-tab-all active" id="profile-tab-all" onclick="selectProfile(null)">All</button>
+    <div class="profile-divider"></div>`;
+  const acctTabs = allAccounts.map(a => {
+    const color = accountColor(a);
+    return `<button class="profile-tab" data-profile="${escapeHTML(a)}" onclick="selectProfile('${escapeHTML(a)}')" style="--profile-color:${color}">
+      <span class="profile-dot" style="background:${color}"></span>
+      ${escapeHTML(a)}
+    </button>`;
+  }).join('');
+  container.innerHTML = allTab + acctTabs;
+
+  // If only one account, hide profile tabs and remove filter-controls left border
+  if (allAccounts.length <= 1) {
+    container.style.display = 'none';
+    const fc = document.getElementById('filter-controls');
+    if (fc) { fc.style.borderLeft = 'none'; fc.style.paddingLeft = '0'; fc.style.marginLeft = '0'; }
+  }
+}
+
+function selectProfile(account) {
+  selectedProfile = account;
+  if (account === null) {
+    const allAccounts = Array.from(document.querySelectorAll('[data-profile]')).map(b => b.dataset.profile);
+    selectedAccounts = new Set(allAccounts);
+  } else {
+    selectedAccounts = new Set([account]);
+  }
+
+  // Update tab styles
+  const allTab = document.getElementById('profile-tab-all');
+  if (allTab) allTab.classList.toggle('active', account === null);
+
+  document.querySelectorAll('.profile-tab').forEach(btn => {
+    const isActive = btn.dataset.profile === account;
+    btn.classList.toggle('active', isActive);
+    const color = accountColor(btn.dataset.profile);
+    btn.style.color = isActive ? color : '';
+    btn.style.borderBottomColor = isActive ? color : '';
+  });
+
+  applyFilter();
+}
+
 function buildFilterUI(allModels) {
   const sorted = [...allModels].sort((a, b) => {
     const pa = modelPriority(a), pb = modelPriority(b);
@@ -679,9 +801,11 @@ function applyFilter() {
 
   const cutoff = getRangeCutoff(selectedRange);
 
-  // Filter daily rows by model + date range
+  // Filter daily rows by model + account + date range
   const filteredDaily = rawData.daily_by_model.filter(r =>
-    selectedModels.has(r.model) && (!cutoff || r.day >= cutoff)
+    selectedModels.has(r.model) &&
+    selectedAccounts.has(r.account || 'default') &&
+    (!cutoff || r.day >= cutoff)
   );
 
   // Daily chart: aggregate by day
@@ -708,9 +832,11 @@ function applyFilter() {
     m.turns          += r.turns;
   }
 
-  // Filter sessions by model + date range
+  // Filter sessions by model + account + date range
   const filteredSessions = rawData.sessions_all.filter(s =>
-    selectedModels.has(s.model) && (!cutoff || s.last_date >= cutoff)
+    selectedModels.has(s.model) &&
+    selectedAccounts.has(s.account || 'default') &&
+    (!cutoff || s.last_date >= cutoff)
   );
 
   // Add session counts into modelMap
@@ -762,18 +888,18 @@ function rerenderSessionsOnly() {
 function renderStats(t) {
   const rangeLabel = RANGE_LABELS[selectedRange].toLowerCase();
   const stats = [
-    { label: 'Sessions',       value: t.sessions.toLocaleString(), sub: rangeLabel },
-    { label: 'Turns',          value: fmt(t.turns),                sub: rangeLabel },
-    { label: 'Input Tokens',   value: fmt(t.input),                sub: rangeLabel },
-    { label: 'Output Tokens',  value: fmt(t.output),               sub: rangeLabel },
-    { label: 'Cache Read',     value: fmt(t.cache_read),           sub: 'from prompt cache' },
-    { label: 'Cache Creation', value: fmt(t.cache_creation),       sub: 'writes to prompt cache' },
-    { label: 'Est. Cost',      value: fmtCostBig(t.cost),          sub: 'API pricing, Apr 2026', color: '#4ade80' },
+    { label: 'Sessions',       value: t.sessions.toLocaleString(), sub: rangeLabel,             cls: '' },
+    { label: 'Turns',          value: fmt(t.turns),                sub: rangeLabel,             cls: '' },
+    { label: 'Input Tokens',   value: fmt(t.input),                sub: 'prompt tokens',        cls: 'stat-tokens' },
+    { label: 'Output Tokens',  value: fmt(t.output),               sub: 'generated tokens',     cls: 'stat-tokens' },
+    { label: 'Cache Read',     value: fmt(t.cache_read),           sub: 'from prompt cache',    cls: 'stat-cache' },
+    { label: 'Cache Creation', value: fmt(t.cache_creation),       sub: 'writes to cache',      cls: 'stat-cache' },
+    { label: 'Est. Cost',      value: fmtCostBig(t.cost),          sub: 'API pricing, Apr 2026',cls: 'stat-primary' },
   ];
   document.getElementById('stats-row').innerHTML = stats.map(s => `
-    <div class="stat-card">
+    <div class="stat-card ${s.cls}">
       <div class="label">${s.label}</div>
-      <div class="value" style="${s.color ? 'color:' + s.color : ''}">${s.value}</div>
+      <div class="value">${s.value}</div>
       ${s.sub ? `<div class="sub">${s.sub}</div>` : ''}
     </div>
   `).join('');
@@ -866,6 +992,7 @@ function renderSessionsTable(sessions) {
         </div>
       </td>
       <td>${s.project}</td>
+      <td><span class="account-tag" style="color:${accountColor(s.account)}">${s.account || 'default'}</span></td>
       <td class="muted">${s.last}</td>
       <td class="muted">${s.duration_min}m</td>
       <td><span class="model-tag">${s.model}</span></td>
@@ -1146,6 +1273,8 @@ async function loadData() {
       document.querySelectorAll('.range-btn').forEach(btn =>
         btn.classList.toggle('active', btn.dataset.range === selectedRange)
       );
+      // Build profile selector
+      buildProfileUI(d.all_accounts || []);
       // Build model filter (reads URL for model selection too)
       buildFilterUI(d.all_models);
     }
