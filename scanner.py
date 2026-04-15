@@ -13,6 +13,17 @@ PROJECTS_DIR = Path.home() / ".claude" / "projects"
 DB_PATH = Path.home() / ".claude" / "usage.db"
 
 
+def discover_accounts():
+    """Return list of (account_name, projects_dir) for all Claude config dirs."""
+    home = Path.home()
+    accounts = [("default", home / ".claude" / "projects")]
+    for d in sorted(home.glob(".claude-*")):
+        if d.is_dir() and (d / "projects").exists():
+            account_name = d.name[len(".claude-"):]  # strip ".claude-" prefix
+            accounts.append((account_name, d / "projects"))
+    return accounts
+
+
 def get_db(db_path=DB_PATH):
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
@@ -32,7 +43,8 @@ def init_db(conn):
             total_cache_read        INTEGER DEFAULT 0,
             total_cache_creation    INTEGER DEFAULT 0,
             model           TEXT,
-            turn_count      INTEGER DEFAULT 0
+            turn_count      INTEGER DEFAULT 0,
+            account         TEXT DEFAULT 'default'
         );
 
         CREATE TABLE IF NOT EXISTS turns (
@@ -45,7 +57,8 @@ def init_db(conn):
             cache_read_tokens       INTEGER DEFAULT 0,
             cache_creation_tokens   INTEGER DEFAULT 0,
             tool_name               TEXT,
-            cwd                     TEXT
+            cwd                     TEXT,
+            account                 TEXT DEFAULT 'default'
         );
 
         CREATE TABLE IF NOT EXISTS processed_files (
@@ -58,6 +71,11 @@ def init_db(conn):
         CREATE INDEX IF NOT EXISTS idx_turns_timestamp ON turns(timestamp);
         CREATE INDEX IF NOT EXISTS idx_sessions_first ON sessions(first_timestamp);
     """)
+    # Migrate existing DBs: add account column if missing
+    for table in ("sessions", "turns"):
+        cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+        if "account" not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN account TEXT DEFAULT 'default'")
     conn.commit()
 
 
@@ -207,14 +225,14 @@ def upsert_sessions(conn, sessions):
                 INSERT INTO sessions
                     (session_id, project_name, first_timestamp, last_timestamp,
                      git_branch, total_input_tokens, total_output_tokens,
-                     total_cache_read, total_cache_creation, model, turn_count)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     total_cache_read, total_cache_creation, model, turn_count, account)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 s["session_id"], s["project_name"], s["first_timestamp"],
                 s["last_timestamp"], s["git_branch"],
                 s["total_input_tokens"], s["total_output_tokens"],
                 s["total_cache_read"], s["total_cache_creation"],
-                s["model"], s["turn_count"]
+                s["model"], s["turn_count"], s.get("account", "default")
             ))
         else:
             # Update: add new tokens on top of existing (since we only insert new turns)
@@ -241,29 +259,70 @@ def insert_turns(conn, turns):
     conn.executemany("""
         INSERT INTO turns
             (session_id, timestamp, model, input_tokens, output_tokens,
-             cache_read_tokens, cache_creation_tokens, tool_name, cwd)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             cache_read_tokens, cache_creation_tokens, tool_name, cwd, account)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, [
         (t["session_id"], t["timestamp"], t["model"],
          t["input_tokens"], t["output_tokens"],
          t["cache_read_tokens"], t["cache_creation_tokens"],
-         t["tool_name"], t["cwd"])
+         t["tool_name"], t["cwd"], t.get("account", "default"))
         for t in turns
     ])
 
 
-def scan(projects_dir=PROJECTS_DIR, db_path=DB_PATH, verbose=True):
+def scan(projects_dir=None, db_path=DB_PATH, verbose=True):
     conn = get_db(db_path)
     init_db(conn)
 
-    jsonl_files = glob.glob(str(projects_dir / "**" / "*.jsonl"), recursive=True)
-    jsonl_files.sort()
+    # Discover all accounts (default + ~/.claude-* dirs)
+    if projects_dir is not None:
+        # Legacy: single dir passed explicitly, treat as "default"
+        accounts = [("default", Path(projects_dir))]
+    else:
+        accounts = discover_accounts()
+
+    if verbose:
+        account_names = [name for name, _ in accounts]
+        print(f"Accounts found: {', '.join(account_names)}")
 
     new_files = 0
     updated_files = 0
     skipped_files = 0
     total_turns = 0
     total_sessions = set()
+
+    for account_name, acct_projects_dir in accounts:
+        if verbose:
+            print(f"\n── Account: {account_name} ({acct_projects_dir}) ──")
+        _scan_account(conn, account_name, acct_projects_dir, verbose,
+                      new_files_ref := [0], updated_files_ref := [0],
+                      skipped_files_ref := [0], total_turns_ref := [0],
+                      total_sessions)
+        new_files     += new_files_ref[0]
+        updated_files += updated_files_ref[0]
+        skipped_files += skipped_files_ref[0]
+        total_turns   += total_turns_ref[0]
+
+    if verbose:
+        print(f"\nScan complete:")
+        print(f"  New files:     {new_files}")
+        print(f"  Updated files: {updated_files}")
+        print(f"  Skipped files: {skipped_files}")
+        print(f"  Turns added:   {total_turns}")
+        print(f"  Sessions seen: {len(total_sessions)}")
+
+    conn.close()
+    return {"new": new_files, "updated": updated_files, "skipped": skipped_files,
+            "turns": total_turns, "sessions": len(total_sessions)}
+
+
+def _scan_account(conn, account_name, projects_dir, verbose,
+                  new_files_ref, updated_files_ref, skipped_files_ref,
+                  total_turns_ref, total_sessions):
+    if not projects_dir.exists():
+        return
+
+    jsonl_files = sorted(glob.glob(str(projects_dir / "**" / "*.jsonl"), recursive=True))
 
     for filepath in jsonl_files:
         try:
@@ -277,7 +336,7 @@ def scan(projects_dir=PROJECTS_DIR, db_path=DB_PATH, verbose=True):
         ).fetchone()
 
         if row and abs(row["mtime"] - mtime) < 0.01:
-            skipped_files += 1
+            skipped_files_ref[0] += 1
             continue
 
         is_new = row is None
@@ -290,20 +349,15 @@ def scan(projects_dir=PROJECTS_DIR, db_path=DB_PATH, verbose=True):
         if turns or session_metas:
             sessions = aggregate_sessions(session_metas, turns)
 
-            # For incremental updates: only insert turns not already in DB
             if not is_new:
-                # Get existing turns count to detect which are new
-                # Simple approach: delete old turns for these sessions and re-insert
-                # More correct: track file line count and only process new lines
                 old_lines = row["lines"] if row else 0
-                # Re-parse only if file grew
                 current_lines = sum(1 for _ in open(filepath, encoding="utf-8", errors="replace"))
 
                 if current_lines <= old_lines:
                     conn.execute("UPDATE processed_files SET mtime = ? WHERE path = ?",
                                  (mtime, filepath))
                     conn.commit()
-                    skipped_files += 1
+                    skipped_files_ref[0] += 1
                     continue
 
                 # Only process the new lines
@@ -356,35 +410,41 @@ def scan(projects_dir=PROJECTS_DIR, db_path=DB_PATH, verbose=True):
                                 "cache_creation_tokens": cache_creation,
                                 "tool_name": tool_name,
                                 "cwd": record.get("cwd", ""),
+                                "account": account_name,
                             })
                 except Exception as e:
                     print(f"  Warning: {e}")
 
                 turns = new_turns
                 sessions = aggregate_sessions(list(new_metas.values()) or [], turns)
-                # Update session timestamps from full parse
                 for meta in session_metas:
                     sessions_to_update = [s for s in sessions if s["session_id"] == meta["session_id"]]
                     if not sessions_to_update:
-                        # Session exists but no new turns -- still update timestamps
                         sessions.append({**meta,
                                          "total_input_tokens": 0,
                                          "total_output_tokens": 0,
                                          "total_cache_read": 0,
                                          "total_cache_creation": 0,
                                          "turn_count": 0,
-                                         "model": meta.get("model")})
+                                         "model": meta.get("model"),
+                                         "account": account_name})
 
-                updated_files += 1
+                updated_files_ref[0] += 1
             else:
-                new_files += 1
+                new_files_ref[0] += 1
+
+            # Tag all sessions and turns with this account
+            for s in sessions:
+                s["account"] = account_name
+            for t in turns:
+                t["account"] = account_name
 
             upsert_sessions(conn, sessions)
             insert_turns(conn, turns)
 
             for s in sessions:
                 total_sessions.add(s["session_id"])
-            total_turns += len(turns)
+            total_turns_ref[0] += len(turns)
 
         # Record file as processed
         line_count = sum(1 for _ in open(filepath, encoding="utf-8", errors="replace"))
@@ -393,18 +453,6 @@ def scan(projects_dir=PROJECTS_DIR, db_path=DB_PATH, verbose=True):
             VALUES (?, ?, ?)
         """, (filepath, mtime, line_count))
         conn.commit()
-
-    if verbose:
-        print(f"\nScan complete:")
-        print(f"  New files:     {new_files}")
-        print(f"  Updated files: {updated_files}")
-        print(f"  Skipped files: {skipped_files}")
-        print(f"  Turns added:   {total_turns}")
-        print(f"  Sessions seen: {len(total_sessions)}")
-
-    conn.close()
-    return {"new": new_files, "updated": updated_files, "skipped": skipped_files,
-            "turns": total_turns, "sessions": len(total_sessions)}
 
 
 if __name__ == "__main__":
