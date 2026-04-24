@@ -72,22 +72,47 @@ python cli.py stats
 python cli.py dashboard
 ```
 
-The scanner is incremental — it tracks each file's path and modification time, so re-running `scan` is fast and only processes new or changed files.
+---
+
+## Features
+
+- **Multi-account support** — automatically discovers all Claude profiles and merges their usage into a single dashboard. Switch between accounts using the profile tabs in the top bar (see setup below).
+- **Session transcript viewer** — click any session row to open the full conversation in a modal, with user and assistant messages rendered as a readable transcript.
+- **Session hover preview** — hover over a session row to see a quick summary card: first user message, model, message count, and token total.
+- **Bookmarkable filters** — active account, model filter, and open session are reflected in the URL so you can share or reload a specific view.
+- **Auto-refresh** — the dashboard polls for new data every 30 seconds without a full page reload.
+
+---
+
+## Multi-account setup
+
+If you use Claude Code with multiple accounts (e.g. personal and work), each account needs its own config directory named `.claude-<accountname>` in your home folder.
+
+To add an account, run Claude Code with the `--config-dir` flag pointing to that directory:
+
+```bash
+claude --config-dir ~/.claude-personal
+claude --config-dir ~/.claude-work
+```
+
+The scanner automatically discovers any directory matching `~/.claude-*` that contains a `projects/` subfolder. No extra configuration needed — just run `python3 cli.py scan` and all accounts will be picked up.
+
+The account name shown in the dashboard is derived from the directory name: `~/.claude-personal` → `personal`.
 
 ---
 
 ## How it works
 
-Claude Code writes one JSONL file per session to `~/.claude/projects/`. Each line is a JSON record; `assistant`-type records contain:
+Claude Code writes one JSONL file per session under `~/.claude/projects/` (and equivalent paths for other profiles). Each line is a JSON record; `assistant`-type records contain:
 - `message.usage.input_tokens` — raw prompt tokens
 - `message.usage.output_tokens` — generated tokens
 - `message.usage.cache_creation_input_tokens` — tokens written to prompt cache
 - `message.usage.cache_read_input_tokens` — tokens served from prompt cache
 - `message.model` — the model used (e.g. `claude-sonnet-4-6`)
 
-`scanner.py` parses those files and stores the data in a SQLite database at `~/.claude/usage.db`.
+`scanner.py` discovers all Claude config directories, parses the JSONL files, and stores the data in a SQLite database at `~/.claude/usage.db`. The scanner is incremental — it tracks each file's modification time, so re-running `scan` only processes new or changed files.
 
-`dashboard.py` serves a single-page dashboard on `localhost:8080` with Chart.js charts (loaded from CDN). It auto-refreshes every 30 seconds and supports model filtering with bookmarkable URLs.
+`dashboard.py` serves a single-page dashboard on `localhost:8080` with Chart.js charts (loaded from CDN).
 
 ---
 
@@ -111,6 +136,6 @@ Costs are calculated using **Anthropic API pricing as of April 2026** ([claude.c
 
 | File | Purpose |
 |------|---------|
-| `scanner.py` | Parses JSONL transcripts, writes to `~/.claude/usage.db` |
+| `scanner.py` | Discovers all Claude profiles, parses JSONL transcripts, writes to `~/.claude/usage.db` |
 | `dashboard.py` | HTTP server + single-page HTML/JS dashboard |
 | `cli.py` | `scan`, `today`, `stats`, `dashboard` commands |

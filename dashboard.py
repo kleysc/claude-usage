@@ -13,6 +13,16 @@ DB_PATH = Path.home() / ".claude" / "usage.db"
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
 
 
+def discover_account_dirs():
+    """Return list of all projects directories across all Claude accounts."""
+    home = Path.home()
+    dirs = [home / ".claude" / "projects"]
+    for d in sorted(home.glob(".claude-*")):
+        if d.is_dir() and (d / "projects").exists():
+            dirs.append(d / "projects")
+    return dirs
+
+
 def get_dashboard_data(db_path=DB_PATH):
     if not db_path.exists():
         return {"error": "Database not found. Run: python cli.py scan"}
@@ -149,28 +159,34 @@ def extract_text(value):
     return str(value).strip()
 
 
-def find_session_file(session_id, projects_dir=PROJECTS_DIR):
-    for path in projects_dir.glob("**/*.jsonl"):
+def find_session_file(session_id, projects_dirs=None):
+    if projects_dirs is None:
+        projects_dirs = discover_account_dirs()
+    all_jsonl = [p for d in projects_dirs for p in d.glob("**/*.jsonl")]
+
+    for path in all_jsonl:
         if path.stem == session_id:
             return path
 
-    candidate = None
-    for path in projects_dir.glob("**/*.jsonl"):
+    for path in all_jsonl:
         try:
             with path.open(encoding="utf-8", errors="replace") as f:
                 for line in f:
-                    if session_id in line:
-                        candidate = path
-                        break
+                    if session_id not in line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                        if rec.get("sessionId") == session_id:
+                            return path
+                    except json.JSONDecodeError:
+                        pass
         except OSError:
             continue
-        if candidate:
-            break
-    return candidate
+    return None
 
 
-def get_session_detail(session_id, projects_dir=PROJECTS_DIR):
-    path = find_session_file(session_id, projects_dir=projects_dir)
+def get_session_detail(session_id):
+    path = find_session_file(session_id)
     if not path:
         return {"error": f"Session not found for id {session_id}"}
 
@@ -258,8 +274,8 @@ def get_session_detail(session_id, projects_dir=PROJECTS_DIR):
     }
 
 
-def get_session_preview(session_id, projects_dir=PROJECTS_DIR):
-    detail = get_session_detail(session_id, projects_dir=projects_dir)
+def get_session_preview(session_id):
+    detail = get_session_detail(session_id)
     if detail.get("error"):
         return detail
 
