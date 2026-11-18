@@ -3,122 +3,44 @@ dashboard.py - Local web dashboard served on localhost:8080.
 """
 
 import json
-import sqlite3
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from datetime import datetime
 from urllib.parse import urlparse, parse_qs
 
-DB_PATH = Path.home() / ".claude" / "usage.db"
-PROJECTS_DIR = Path.home() / ".claude" / "projects"
+from store import DB_PATH, connect
+from collectors.common import discover_accounts
+import queries
 
 
-def discover_account_dirs():
-    """Return list of all projects directories across all Claude accounts."""
-    home = Path.home()
-    dirs = [home / ".claude" / "projects"]
-    for d in sorted(home.glob(".claude-*")):
-        if d.is_dir() and (d / "projects").exists():
-            dirs.append(d / "projects")
-    return dirs
+WEB_DIR = Path(__file__).with_name('web')
+STATIC = {'/': ('index.html', 'text/html; charset=utf-8'),
+          '/index.html': ('index.html', 'text/html; charset=utf-8'),
+          '/app.js': ('app.js', 'text/javascript; charset=utf-8'),
+          '/style.css': ('style.css', 'text/css; charset=utf-8')}
 
 
-def get_dashboard_data(db_path=DB_PATH):
-    if not db_path.exists():
+def get_dashboard_data(db_path=DB_PATH, **filters):
+    if not Path(db_path).exists():
         return {"error": "Database not found. Run: python cli.py scan"}
+    conn = connect(db_path)
+    try:
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='events'").fetchone():
+            return {"error": "This database predates the event model. Run: python cli.py migrate"}
+        data = queries.overview(conn, **filters)
+        data.update(
+            last_scan=datetime.fromtimestamp(Path(db_path).stat().st_mtime).strftime('%Y-%m-%d %H:%M'),
+            generated_at=datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+        return data
+    finally:
+        conn.close()
 
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
 
-    # ── All accounts (for filter UI) ─────────────────────────────────────────
-    account_rows = conn.execute("""
-        SELECT COALESCE(account, 'default') as account
-        FROM sessions
-        GROUP BY account
-        ORDER BY account
-    """).fetchall()
-    all_accounts = [r["account"] for r in account_rows]
-
-    # ── All models (for filter UI) ────────────────────────────────────────────
-    model_rows = conn.execute("""
-        SELECT COALESCE(model, 'unknown') as model
-        FROM turns
-        GROUP BY model
-        ORDER BY SUM(input_tokens + output_tokens) DESC
-    """).fetchall()
-    all_models = [r["model"] for r in model_rows]
-
-    # ── Daily per-model+account, ALL history (client filters by range) ────────
-    daily_rows = conn.execute("""
-        SELECT
-            substr(timestamp, 1, 10)        as day,
-            COALESCE(model, 'unknown')      as model,
-            COALESCE(account, 'default')    as account,
-            SUM(input_tokens)               as input,
-            SUM(output_tokens)              as output,
-            SUM(cache_read_tokens)          as cache_read,
-            SUM(cache_creation_tokens)      as cache_creation,
-            COUNT(*)                        as turns
-        FROM turns
-        GROUP BY day, model, account
-        ORDER BY day, model, account
-    """).fetchall()
-
-    daily_by_model = [{
-        "day":            r["day"],
-        "model":          r["model"],
-        "account":        r["account"],
-        "input":          r["input"] or 0,
-        "output":         r["output"] or 0,
-        "cache_read":     r["cache_read"] or 0,
-        "cache_creation": r["cache_creation"] or 0,
-        "turns":          r["turns"] or 0,
-    } for r in daily_rows]
-
-    # ── All sessions (client filters by range, model, account) ───────────────
-    session_rows = conn.execute("""
-        SELECT
-            session_id, project_name, first_timestamp, last_timestamp,
-            total_input_tokens, total_output_tokens,
-            total_cache_read, total_cache_creation, model, turn_count,
-            COALESCE(account, 'default') as account
-        FROM sessions
-        ORDER BY last_timestamp DESC
-    """).fetchall()
-
-    sessions_all = []
-    for r in session_rows:
-        try:
-            t1 = datetime.fromisoformat(r["first_timestamp"].replace("Z", "+00:00"))
-            t2 = datetime.fromisoformat(r["last_timestamp"].replace("Z", "+00:00"))
-            duration_min = round((t2 - t1).total_seconds() / 60, 1)
-        except Exception:
-            duration_min = 0
-        sessions_all.append({
-            "session_id":    r["session_id"],
-            "session_short": r["session_id"][:8],
-            "project":       r["project_name"] or "unknown",
-            "last":          (r["last_timestamp"] or "")[:16].replace("T", " "),
-            "last_date":     (r["last_timestamp"] or "")[:10],
-            "duration_min":  duration_min,
-            "model":         r["model"] or "unknown",
-            "account":       r["account"],
-            "turns":         r["turn_count"] or 0,
-            "input":         r["total_input_tokens"] or 0,
-            "output":        r["total_output_tokens"] or 0,
-            "cache_read":    r["total_cache_read"] or 0,
-            "cache_creation": r["total_cache_creation"] or 0,
-        })
-
-    conn.close()
-
-    return {
-        "all_accounts":   all_accounts,
-        "all_models":     all_models,
-        "daily_by_model": daily_by_model,
-        "sessions_all":   sessions_all,
-        "generated_at":   datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    }
+def run_scan(db_path=DB_PATH):
+    from scanner import scan
+    result = scan(db_path=db_path, verbose=False)
+    return dict(events_added=result['events_added'], files_read=result['new'] + result['updated'],
+                mismatches=len(result['reconciliation']['mismatches']))
 
 
 def extract_text(value):
@@ -161,7 +83,7 @@ def extract_text(value):
 
 def find_session_file(session_id, projects_dirs=None):
     if projects_dirs is None:
-        projects_dirs = discover_account_dirs()
+        projects_dirs = [path for _, path in discover_accounts()]
     all_jsonl = [p for d in projects_dirs for p in d.glob("**/*.jsonl")]
 
     for path in all_jsonl:
@@ -186,6 +108,8 @@ def find_session_file(session_id, projects_dirs=None):
 
 
 def get_session_detail(session_id):
+    if session_id.startswith(("codex:", "gemini:")):
+        return {"error": "Preview not available for this tool (" + session_id.split(":", 1)[0] + ")."}
     path = find_session_file(session_id)
     if not path:
         return {"error": f"Session not found for id {session_id}"}
@@ -263,7 +187,11 @@ def get_session_detail(session_id):
     if not messages:
         return {"error": f"No readable transcript content found for session {session_id}"}
 
+    from collectors.claude import collect
+    usage_summary = queries.aggregate([e for e in collect(path) if e['session_id'] == session_id])
+    usage_summary = {k: v for k, v in usage_summary.items() if not k.startswith('_')}
     return {
+        "usage": usage_summary,
         "session": session_meta,
         "summary": {
             "message_count": len(messages),
@@ -302,1017 +230,6 @@ def get_session_preview(session_id):
     }
 
 
-HTML_TEMPLATE = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Claude Code Usage Dashboard</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
-<style>
-  :root {
-    --bg: #0f1117;
-    --card: #1a1d27;
-    --border: #2a2d3a;
-    --text: #e2e8f0;
-    --muted: #8892a4;
-    --accent: #d97757;
-    --blue: #4f8ef7;
-    --green: #4ade80;
-  }
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 14px; }
-
-  /* ── Header ── */
-  header { background: var(--card); border-bottom: 1px solid var(--border); padding: 0 24px; height: 52px; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
-  header h1 { font-size: 15px; font-weight: 600; color: var(--text); display: flex; align-items: center; gap: 10px; }
-  header h1::before { content: ''; display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 3px rgba(217,119,87,0.2); flex-shrink: 0; }
-  header .meta { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
-
-  /* ── Unified top bar: profile tabs (left) + filter controls (right) ── */
-  #top-bar { background: var(--card); border-bottom: 1px solid var(--border); display: flex; align-items: stretch; padding: 0 24px; min-height: 40px; overflow-x: auto; scrollbar-width: none; }
-  #top-bar::-webkit-scrollbar { display: none; }
-  #profile-tabs { display: flex; align-items: stretch; flex-shrink: 0; }
-  #filter-controls { margin-left: auto; display: flex; align-items: center; gap: 8px; flex-shrink: 0; padding-left: 16px; border-left: 1px solid var(--border); }
-
-  /* Profile tabs */
-  .profile-tab { display: inline-flex; align-items: center; gap: 6px; padding: 0 16px; height: 40px; border: none; border-bottom: 2px solid transparent; background: transparent; color: var(--muted); font-size: 12px; font-weight: 500; letter-spacing: 0.01em; cursor: pointer; white-space: nowrap; transition: color 0.12s, border-color 0.12s; user-select: none; flex-shrink: 0; }
-  .profile-tab:hover { color: var(--text); background: rgba(255,255,255,0.03); }
-  .profile-tab.active { color: var(--profile-color, var(--accent)); border-bottom-color: var(--profile-color, var(--accent)); font-weight: 600; }
-  .profile-tab.active .profile-dot { box-shadow: 0 0 0 2px var(--card), 0 0 0 3px var(--profile-color, var(--accent)); }
-  .profile-tab-all { display: inline-flex; align-items: center; padding: 0 16px; height: 40px; border: none; border-bottom: 2px solid transparent; background: transparent; color: var(--muted); font-size: 12px; font-weight: 500; cursor: pointer; white-space: nowrap; transition: color 0.12s, border-color 0.12s; flex-shrink: 0; }
-  .profile-tab-all:hover { color: var(--text); background: rgba(255,255,255,0.03); }
-  .profile-tab-all.active { color: var(--text); border-bottom-color: rgba(255,255,255,0.3); font-weight: 600; }
-  .profile-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; transition: box-shadow 0.15s; }
-  .profile-divider { width: 1px; background: var(--border); margin: 10px 4px; flex-shrink: 0; }
-
-  /* Filter controls */
-  .filter-sep { width: 1px; height: 20px; background: var(--border); flex-shrink: 0; }
-  #model-checkboxes { display: flex; flex-wrap: nowrap; gap: 5px; }
-  .model-cb-label { display: flex; align-items: center; gap: 4px; padding: 2px 9px; border-radius: 20px; border: 1px solid var(--border); cursor: pointer; font-size: 11px; color: var(--muted); transition: border-color 0.15s, color 0.15s, background 0.15s; user-select: none; white-space: nowrap; }
-  .model-cb-label:hover { border-color: var(--accent); color: var(--text); }
-  .model-cb-label.checked { background: rgba(217,119,87,0.12); border-color: var(--accent); color: var(--text); }
-  .model-cb-label input { display: none; }
-  .filter-btn { padding: 2px 8px; border-radius: 4px; border: 1px solid var(--border); background: transparent; color: var(--muted); font-size: 11px; cursor: pointer; white-space: nowrap; }
-  .filter-btn:hover { border-color: var(--accent); color: var(--text); }
-  .range-group { display: flex; border: 1px solid var(--border); border-radius: 5px; overflow: hidden; flex-shrink: 0; }
-  .range-btn { padding: 3px 11px; background: transparent; border: none; border-right: 1px solid var(--border); color: var(--muted); font-size: 11px; cursor: pointer; transition: background 0.15s, color 0.15s; }
-  .range-btn:last-child { border-right: none; }
-  .range-btn:hover { background: rgba(255,255,255,0.04); color: var(--text); }
-  .range-btn.active { background: rgba(217,119,87,0.15); color: var(--accent); font-weight: 600; }
-
-  /* ── Stats row ── */
-  .container { max-width: 1400px; margin: 0 auto; padding: 24px; }
-  .stats-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 24px; }
-  .stat-card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; position: relative; overflow: hidden; transition: border-color 0.15s; }
-  .stat-card:hover { border-color: rgba(255,255,255,0.1); }
-  .stat-card::before { content: ''; position: absolute; left: 0; top: 12px; bottom: 12px; width: 2px; border-radius: 0 2px 2px 0; background: var(--stat-accent, var(--border)); }
-  .stat-card .label { color: var(--muted); font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 8px; }
-  .stat-card .value { font-size: 20px; font-weight: 700; line-height: 1; font-variant-numeric: tabular-nums; color: var(--stat-color, var(--text)); }
-  .stat-card .sub { color: var(--muted); font-size: 10px; margin-top: 5px; line-height: 1.4; }
-  .stat-card.stat-primary { border-color: rgba(74,222,128,0.2); background: linear-gradient(135deg, rgba(74,222,128,0.06) 0%, var(--card) 60%); --stat-accent: var(--green); --stat-color: var(--green); }
-  .stat-card.stat-tokens { --stat-accent: var(--blue); }
-  .stat-card.stat-cache { --stat-accent: rgba(251,191,36,0.6); }
-
-  /* ── Charts ── */
-  .charts-grid { display: grid; grid-template-columns: 1.6fr 1fr; gap: 16px; margin-bottom: 24px; }
-  .chart-card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 20px; }
-  .chart-card.wide { grid-column: 1 / -1; }
-  .chart-card h2 { font-size: 11px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 16px; }
-  .chart-wrap { position: relative; height: 240px; }
-  .chart-wrap.tall { height: 300px; }
-
-  /* ── Tables ── */
-  .table-card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 20px; margin-bottom: 24px; overflow: hidden; }
-  .table-scroll { overflow-x: auto; }
-  table { width: 100%; border-collapse: collapse; }
-  thead { position: sticky; top: 0; z-index: 2; }
-  th { background: var(--card); text-align: left; padding: 8px 12px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); border-bottom: 1px solid var(--border); }
-  td { padding: 10px 12px; border-bottom: 1px solid var(--border); font-size: 13px; }
-  tr:last-child td { border-bottom: none; }
-  tr:hover td { background: rgba(255,255,255,0.02); }
-  .model-tag { display: inline-block; padding: 2px 7px; border-radius: 4px; font-size: 11px; background: rgba(79,142,247,0.15); color: var(--blue); }
-  .account-tag { display: inline-block; padding: 2px 7px; border-radius: 4px; font-size: 11px; font-weight: 600; }
-  .cost { color: var(--green); font-family: monospace; }
-  .cost-na { color: var(--muted); font-family: monospace; font-size: 11px; }
-  .num { font-family: monospace; }
-  .muted { color: var(--muted); }
-  .section-title { font-size: 11px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; padding-bottom: 10px; border-bottom: 1px solid var(--border); margin-bottom: 0; }
-  .sessions-table tbody tr { cursor: pointer; }
-  .sessions-table tbody tr.active td { background: rgba(217,119,87,0.1); }
-  .session-link { display: flex; flex-direction: column; gap: 2px; }
-  .session-link-id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--text); }
-  .session-link-meta { color: var(--muted); font-size: 11px; }
-  .session-row-hover { position: relative; }
-  .session-hover-card { position: absolute; left: 18px; top: calc(100% + 8px); width: min(420px, 72vw); padding: 14px; border-radius: 14px; background: rgba(17,20,28,0.98); border: 1px solid rgba(255,255,255,0.08); box-shadow: 0 18px 40px rgba(0,0,0,0.38); z-index: 40; pointer-events: none; }
-  .session-hover-kicker { color: var(--accent); font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 8px; }
-  .session-hover-title { color: var(--text); font-size: 14px; font-weight: 600; line-height: 1.5; margin-bottom: 10px; }
-  .session-hover-meta { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
-  .session-hover-pill { display: inline-flex; padding: 4px 8px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); font-size: 10px; background: rgba(255,255,255,0.03); }
-  .session-hover-body { color: var(--muted); font-size: 12px; line-height: 1.6; }
-  .session-modal-backdrop { position: fixed; inset: 0; background: rgba(8,10,14,0.72); backdrop-filter: blur(6px); display: none; align-items: center; justify-content: center; padding: 24px; z-index: 1000; }
-  .session-modal-backdrop.open { display: flex; }
-  .session-modal { width: min(1040px, 100%); max-height: min(88vh, 920px); overflow: hidden; background: linear-gradient(180deg, rgba(30,33,43,0.98), rgba(20,23,31,0.98)); border: 1px solid rgba(255,255,255,0.08); border-radius: 18px; box-shadow: 0 30px 90px rgba(0,0,0,0.45); display: flex; flex-direction: column; }
-  .session-modal-header { padding: 18px 22px 14px; border-bottom: 1px solid var(--border); display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
-  .session-modal-title { font-size: 18px; font-weight: 700; }
-  .session-modal-subtitle { color: var(--muted); margin-top: 4px; }
-  .session-modal-controls { display: flex; align-items: center; gap: 10px; }
-  .session-detail-close { border: 1px solid var(--border); background: transparent; color: var(--muted); border-radius: 8px; padding: 7px 11px; cursor: pointer; }
-  .session-detail-close:hover { border-color: var(--accent); color: var(--text); }
-  .session-modal-body { overflow: auto; padding: 20px 22px 24px; }
-  .session-hero { margin-bottom: 18px; padding: 18px 20px; border-radius: 16px; background: linear-gradient(135deg, rgba(217,119,87,0.18), rgba(79,142,247,0.08)); border: 1px solid rgba(255,255,255,0.08); }
-  .session-kicker { color: var(--accent); font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 8px; }
-  .session-hero-title { font-size: 22px; line-height: 1.3; font-weight: 700; color: var(--text); }
-  .session-hero-text { margin-top: 10px; color: var(--muted); line-height: 1.7; max-width: 78ch; }
-  .session-overview { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 18px; }
-  .session-overview-card { background: rgba(255,255,255,0.03); border: 1px solid var(--border); border-radius: 14px; padding: 14px 15px; }
-  .session-overview-label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 6px; }
-  .session-overview-value { color: var(--text); font-size: 15px; font-weight: 600; line-height: 1.4; }
-  .session-overview-sub { color: var(--muted); font-size: 11px; margin-top: 4px; line-height: 1.5; }
-  .session-summary { display: grid; grid-template-columns: 1.2fr 1fr; gap: 16px; margin-bottom: 18px; }
-  .session-summary-card { background: rgba(255,255,255,0.03); border: 1px solid var(--border); border-radius: 14px; padding: 16px; }
-  .session-summary-label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 8px; }
-  .session-summary-text { line-height: 1.6; color: var(--text); }
-  .session-detail-meta { display: flex; flex-wrap: wrap; gap: 8px; }
-  .session-detail-pill { display: inline-flex; align-items: center; gap: 6px; padding: 5px 10px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); font-size: 11px; background: rgba(255,255,255,0.03); }
-  .transcript-section-title { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 10px; }
-  .session-detail-empty { color: var(--muted); line-height: 1.6; padding: 20px; }
-  .session-detail-error { color: #f87171; padding: 20px; }
-  .message-list { display: flex; flex-direction: column; gap: 14px; }
-  .message-card { border-radius: 16px; padding: 14px 16px; max-width: 88%; }
-  .message-card.user { align-self: flex-start; background: rgba(79,142,247,0.12); border: 1px solid rgba(79,142,247,0.28); }
-  .message-card.assistant { align-self: flex-end; background: rgba(217,119,87,0.12); border: 1px solid rgba(217,119,87,0.28); }
-  .message-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
-  .message-role { font-size: 11px; letter-spacing: 0.05em; text-transform: uppercase; color: var(--muted); }
-  .message-meta { color: var(--muted); font-size: 11px; text-align: right; }
-  .message-body { white-space: pre-wrap; line-height: 1.7; word-break: break-word; font-size: 13px; }
-  .message-activity-group { display: flex; flex-direction: column; gap: 8px; align-items: center; }
-  .message-activity { width: min(720px, 100%); background: rgba(255,255,255,0.03); border: 1px dashed var(--border); border-radius: 12px; padding: 10px 12px; }
-  .message-activity-label { color: var(--accent); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 6px; }
-  .message-activity-body { color: var(--muted); line-height: 1.6; white-space: pre-wrap; word-break: break-word; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
-
-  footer { border-top: 1px solid var(--border); padding: 20px 24px; margin-top: 8px; }
-  .footer-content { max-width: 1400px; margin: 0 auto; }
-  .footer-content p { color: var(--muted); font-size: 12px; line-height: 1.7; margin-bottom: 4px; }
-  .footer-content p:last-child { margin-bottom: 0; }
-  .footer-content a { color: var(--blue); text-decoration: none; }
-  .footer-content a:hover { text-decoration: underline; }
-
-  @media (max-width: 768px) {
-    .charts-grid { grid-template-columns: 1fr; }
-    .chart-card.wide { grid-column: 1; }
-    #top-bar { flex-wrap: wrap; }
-    #filter-controls { margin-left: 0; border-left: none; padding-left: 0; border-top: 1px solid var(--border); width: 100%; padding: 6px 0; flex-wrap: wrap; }
-    .session-overview { grid-template-columns: 1fr 1fr; }
-    .session-summary { grid-template-columns: 1fr; }
-    .session-modal-backdrop { padding: 12px; }
-    .session-modal { max-height: 94vh; border-radius: 14px; }
-    .message-card { max-width: 100%; }
-  }
-</style>
-</head>
-<body>
-<header>
-  <h1>Claude Code Usage</h1>
-  <div class="meta" id="meta">Loading...</div>
-</header>
-
-<div id="top-bar">
-  <div id="profile-tabs" role="tablist" aria-label="Account profile"></div>
-  <div id="filter-controls">
-    <div id="model-checkboxes"></div>
-    <button class="filter-btn" onclick="selectAllModels()">All</button>
-    <button class="filter-btn" onclick="clearAllModels()">None</button>
-    <div class="filter-sep"></div>
-    <div class="range-group">
-      <button class="range-btn" data-range="7d"  onclick="setRange('7d')">7d</button>
-      <button class="range-btn" data-range="30d" onclick="setRange('30d')">30d</button>
-      <button class="range-btn" data-range="90d" onclick="setRange('90d')">90d</button>
-      <button class="range-btn" data-range="all" onclick="setRange('all')">All</button>
-    </div>
-  </div>
-</div>
-
-<div class="container">
-  <div class="stats-row" id="stats-row"></div>
-  <div class="charts-grid">
-    <div class="chart-card wide">
-      <h2 id="daily-chart-title">Daily Token Usage</h2>
-      <div class="chart-wrap tall"><canvas id="chart-daily"></canvas></div>
-    </div>
-    <div class="chart-card">
-      <h2>By Model</h2>
-      <div class="chart-wrap"><canvas id="chart-model"></canvas></div>
-    </div>
-    <div class="chart-card">
-      <h2>Top Projects by Tokens</h2>
-      <div class="chart-wrap"><canvas id="chart-project"></canvas></div>
-    </div>
-  </div>
-  <div class="table-card">
-    <div class="section-title">Recent Sessions</div>
-    <div class="table-scroll">
-      <table class="sessions-table">
-        <thead><tr>
-          <th>Session</th><th>Project</th><th>Account</th><th>Last Active</th><th>Duration</th>
-          <th>Model</th><th>Turns</th><th>Input</th><th>Output</th><th>Est. Cost</th>
-        </tr></thead>
-        <tbody id="sessions-body"></tbody>
-      </table>
-    </div>
-  </div>
-  <div class="table-card">
-    <div class="section-title">Cost by Model</div>
-    <div class="table-scroll">
-      <table>
-        <thead><tr>
-          <th>Model</th><th>Turns</th><th>Input</th><th>Output</th>
-          <th>Cache Read</th><th>Cache Creation</th><th>Est. Cost</th>
-        </tr></thead>
-        <tbody id="model-cost-body"></tbody>
-      </table>
-    </div>
-  </div>
-</div>
-
-<div id="session-modal-backdrop" class="session-modal-backdrop" onclick="onSessionModalBackdrop(event)">
-  <div class="session-modal" role="dialog" aria-modal="true" aria-labelledby="session-modal-title">
-    <div class="session-modal-header">
-      <div>
-        <div id="session-modal-title" class="session-modal-title">Session Context</div>
-        <div id="session-modal-subtitle" class="session-modal-subtitle">Open a session from the table to inspect its transcript.</div>
-      </div>
-      <div class="session-modal-controls">
-        <button class="session-detail-close" onclick="closeSessionDetail()">Close</button>
-      </div>
-    </div>
-    <div id="session-detail" class="session-modal-body">
-      <div class="session-detail-empty">Click a session row to inspect the transcript context from its source `.jsonl` file.</div>
-    </div>
-  </div>
-</div>
-
-<footer>
-  <div class="footer-content">
-    <p>Cost estimates based on Anthropic API pricing (<a href="https://claude.com/pricing#api" target="_blank">claude.com/pricing#api</a>) as of April 2026. Only models containing <em>opus</em>, <em>sonnet</em>, or <em>haiku</em> in the name are included in cost calculations. Actual costs for Max/Pro subscribers differ from API pricing.</p>
-    <p>
-      GitHub: <a href="https://github.com/phuryn/claude-usage" target="_blank">https://github.com/phuryn/claude-usage</a>
-      &nbsp;&middot;&nbsp;
-      Created by: <a href="https://www.productcompass.pm" target="_blank">The Product Compass Newsletter</a>
-      &nbsp;&middot;&nbsp;
-      License: MIT
-    </p>
-  </div>
-</footer>
-
-<script>
-// ── State ──────────────────────────────────────────────────────────────────
-let rawData = null;
-let selectedModels = new Set();
-let selectedAccounts = new Set();
-let selectedRange = '30d';
-let activeSessionId = null;
-let hoverPreviewSessionId = null;
-let hoverPreviewData = null;
-let hoverPreviewTimer = null;
-let previewCache = new Map();
-let visibleSessions = [];
-let charts = {};
-
-// ── Pricing (Anthropic API, April 2026) ────────────────────────────────────
-const PRICING = {
-  'claude-opus-4-6':   { input: 6.15,  output: 30.75, cache_write: 7.69, cache_read: 0.61 },
-  'claude-opus-4-5':   { input: 6.15,  output: 30.75, cache_write: 7.69, cache_read: 0.61 },
-  'claude-sonnet-4-6': { input: 3.69,  output: 18.45, cache_write: 4.61, cache_read: 0.37 },
-  'claude-sonnet-4-5': { input: 3.69,  output: 18.45, cache_write: 4.61, cache_read: 0.37 },
-  'claude-haiku-4-5':  { input: 1.23,  output:  6.15, cache_write: 1.54, cache_read: 0.12 },
-  'claude-haiku-4-6':  { input: 1.23,  output:  6.15, cache_write: 1.54, cache_read: 0.12 },
-};
-
-function isBillable(model) {
-  if (!model) return false;
-  const m = model.toLowerCase();
-  return m.includes('opus') || m.includes('sonnet') || m.includes('haiku');
-}
-
-function getPricing(model) {
-  if (!model) return null;
-  if (PRICING[model]) return PRICING[model];
-  for (const key of Object.keys(PRICING)) {
-    if (model.startsWith(key)) return PRICING[key];
-  }
-  const m = model.toLowerCase();
-  if (m.includes('opus'))   return PRICING['claude-opus-4-6'];
-  if (m.includes('sonnet')) return PRICING['claude-sonnet-4-6'];
-  if (m.includes('haiku'))  return PRICING['claude-haiku-4-5'];
-  return null;
-}
-
-function calcCost(model, inp, out, cacheRead, cacheCreation) {
-  if (!isBillable(model)) return 0;
-  const p = getPricing(model);
-  if (!p) return 0;
-  return (
-    inp           * p.input       / 1e6 +
-    out           * p.output      / 1e6 +
-    cacheRead     * p.cache_read  / 1e6 +
-    cacheCreation * p.cache_write / 1e6
-  );
-}
-
-// ── Formatting ─────────────────────────────────────────────────────────────
-function fmt(n) {
-  if (n >= 1e9) return (n/1e9).toFixed(2)+'B';
-  if (n >= 1e6) return (n/1e6).toFixed(2)+'M';
-  if (n >= 1e3) return (n/1e3).toFixed(1)+'K';
-  return n.toLocaleString();
-}
-function fmtCost(c)    { return '$' + c.toFixed(4); }
-function fmtCostBig(c) { return '$' + c.toFixed(2); }
-
-// ── Account / Profile colors ───────────────────────────────────────────────
-const ACCT_PALETTE = ['#d97757','#4f8ef7','#4ade80','#a78bfa','#fbbf24','#f472b6'];
-const _acctColorMap = {};
-function accountColor(account) {
-  const key = account || 'default';
-  if (!_acctColorMap[key]) {
-    const keys = Object.keys(_acctColorMap);
-    _acctColorMap[key] = ACCT_PALETTE[keys.length % ACCT_PALETTE.length];
-  }
-  return _acctColorMap[key];
-}
-
-// Pre-seed color map in insertion order so colors stay stable
-function seedAccountColors(allAccounts) {
-  allAccounts.forEach(a => accountColor(a));
-}
-
-// ── Chart colors ───────────────────────────────────────────────────────────
-const TOKEN_COLORS = {
-  input:          'rgba(79,142,247,0.8)',
-  output:         'rgba(167,139,250,0.8)',
-  cache_read:     'rgba(74,222,128,0.6)',
-  cache_creation: 'rgba(251,191,36,0.6)',
-};
-const MODEL_COLORS = ['#d97757','#4f8ef7','#4ade80','#a78bfa','#fbbf24','#f472b6','#34d399','#60a5fa'];
-
-// ── Time range ─────────────────────────────────────────────────────────────
-const RANGE_LABELS = { '7d': 'Last 7 Days', '30d': 'Last 30 Days', '90d': 'Last 90 Days', 'all': 'All Time' };
-const RANGE_TICKS  = { '7d': 7, '30d': 15, '90d': 13, 'all': 12 };
-
-function getRangeCutoff(range) {
-  if (range === 'all') return null;
-  const days = range === '7d' ? 7 : range === '30d' ? 30 : 90;
-  const d = new Date();
-  d.setDate(d.getDate() - days);
-  return d.toISOString().slice(0, 10);
-}
-
-function readURLRange() {
-  const p = new URLSearchParams(window.location.search).get('range');
-  return ['7d', '30d', '90d', 'all'].includes(p) ? p : '30d';
-}
-
-function readURLSession() {
-  return new URLSearchParams(window.location.search).get('session') || null;
-}
-
-function setRange(range) {
-  selectedRange = range;
-  document.querySelectorAll('.range-btn').forEach(btn =>
-    btn.classList.toggle('active', btn.dataset.range === range)
-  );
-  updateURL();
-  applyFilter();
-}
-
-// ── Model filter ───────────────────────────────────────────────────────────
-function modelPriority(m) {
-  const ml = m.toLowerCase();
-  if (ml.includes('opus'))   return 0;
-  if (ml.includes('sonnet')) return 1;
-  if (ml.includes('haiku'))  return 2;
-  return 3;
-}
-
-function readURLModels(allModels) {
-  const param = new URLSearchParams(window.location.search).get('models');
-  if (!param) return new Set(allModels.filter(m => isBillable(m)));
-  const fromURL = new Set(param.split(',').map(s => s.trim()).filter(Boolean));
-  return new Set(allModels.filter(m => fromURL.has(m)));
-}
-
-function isDefaultModelSelection(allModels) {
-  const billable = allModels.filter(m => isBillable(m));
-  if (selectedModels.size !== billable.length) return false;
-  return billable.every(m => selectedModels.has(m));
-}
-
-// ── Profile selector (single-account radio-style) ──────────────────────────
-// selectedAccounts is a Set, but profile bar drives it as a single selection
-// 'null' means "All profiles"
-let selectedProfile = null; // null = all, string = one account
-
-function buildProfileUI(allAccounts) {
-  seedAccountColors(allAccounts);
-  selectedAccounts = new Set(allAccounts);
-  selectedProfile = null;
-
-  const container = document.getElementById('profile-tabs');
-  const allTab = `<button class="profile-tab-all active" id="profile-tab-all" onclick="selectProfile(null)">All</button>
-    <div class="profile-divider"></div>`;
-  const acctTabs = allAccounts.map(a => {
-    const color = accountColor(a);
-    return `<button class="profile-tab" data-profile="${escapeHTML(a)}" onclick="selectProfile('${escapeHTML(a)}')" style="--profile-color:${color}">
-      <span class="profile-dot" style="background:${color}"></span>
-      ${escapeHTML(a)}
-    </button>`;
-  }).join('');
-  container.innerHTML = allTab + acctTabs;
-
-  // If only one account, hide profile tabs and remove filter-controls left border
-  if (allAccounts.length <= 1) {
-    container.style.display = 'none';
-    const fc = document.getElementById('filter-controls');
-    if (fc) { fc.style.borderLeft = 'none'; fc.style.paddingLeft = '0'; fc.style.marginLeft = '0'; }
-  }
-}
-
-function selectProfile(account) {
-  selectedProfile = account;
-  if (account === null) {
-    const allAccounts = Array.from(document.querySelectorAll('[data-profile]')).map(b => b.dataset.profile);
-    selectedAccounts = new Set(allAccounts);
-  } else {
-    selectedAccounts = new Set([account]);
-  }
-
-  // Update tab styles
-  const allTab = document.getElementById('profile-tab-all');
-  if (allTab) allTab.classList.toggle('active', account === null);
-
-  document.querySelectorAll('.profile-tab').forEach(btn => {
-    const isActive = btn.dataset.profile === account;
-    btn.classList.toggle('active', isActive);
-    const color = accountColor(btn.dataset.profile);
-    btn.style.color = isActive ? color : '';
-    btn.style.borderBottomColor = isActive ? color : '';
-  });
-
-  applyFilter();
-}
-
-function buildFilterUI(allModels) {
-  const sorted = [...allModels].sort((a, b) => {
-    const pa = modelPriority(a), pb = modelPriority(b);
-    return pa !== pb ? pa - pb : a.localeCompare(b);
-  });
-  selectedModels = readURLModels(allModels);
-  const container = document.getElementById('model-checkboxes');
-  container.innerHTML = sorted.map(m => {
-    const checked = selectedModels.has(m);
-    return `<label class="model-cb-label ${checked ? 'checked' : ''}" data-model="${m}">
-      <input type="checkbox" value="${m}" ${checked ? 'checked' : ''} onchange="onModelToggle(this)">
-      ${m}
-    </label>`;
-  }).join('');
-}
-
-function onModelToggle(cb) {
-  const label = cb.closest('label');
-  if (cb.checked) { selectedModels.add(cb.value);    label.classList.add('checked'); }
-  else            { selectedModels.delete(cb.value); label.classList.remove('checked'); }
-  updateURL();
-  applyFilter();
-}
-
-function selectAllModels() {
-  document.querySelectorAll('#model-checkboxes input').forEach(cb => {
-    cb.checked = true; selectedModels.add(cb.value); cb.closest('label').classList.add('checked');
-  });
-  updateURL(); applyFilter();
-}
-
-function clearAllModels() {
-  document.querySelectorAll('#model-checkboxes input').forEach(cb => {
-    cb.checked = false; selectedModels.delete(cb.value); cb.closest('label').classList.remove('checked');
-  });
-  updateURL(); applyFilter();
-}
-
-// ── URL persistence ────────────────────────────────────────────────────────
-function updateURL() {
-  const allModels = Array.from(document.querySelectorAll('#model-checkboxes input')).map(cb => cb.value);
-  const params = new URLSearchParams();
-  if (selectedRange !== '30d') params.set('range', selectedRange);
-  if (!isDefaultModelSelection(allModels)) params.set('models', Array.from(selectedModels).join(','));
-  if (activeSessionId) params.set('session', activeSessionId);
-  const search = params.toString() ? '?' + params.toString() : '';
-  history.replaceState(null, '', window.location.pathname + search);
-}
-
-// ── Aggregation & filtering ────────────────────────────────────────────────
-function applyFilter() {
-  if (!rawData) return;
-
-  const cutoff = getRangeCutoff(selectedRange);
-
-  // Filter daily rows by model + account + date range
-  const filteredDaily = rawData.daily_by_model.filter(r =>
-    selectedModels.has(r.model) &&
-    selectedAccounts.has(r.account || 'default') &&
-    (!cutoff || r.day >= cutoff)
-  );
-
-  // Daily chart: aggregate by day
-  const dailyMap = {};
-  for (const r of filteredDaily) {
-    if (!dailyMap[r.day]) dailyMap[r.day] = { day: r.day, input: 0, output: 0, cache_read: 0, cache_creation: 0 };
-    const d = dailyMap[r.day];
-    d.input          += r.input;
-    d.output         += r.output;
-    d.cache_read     += r.cache_read;
-    d.cache_creation += r.cache_creation;
-  }
-  const daily = Object.values(dailyMap).sort((a, b) => a.day.localeCompare(b.day));
-
-  // By model: aggregate tokens + turns from daily data
-  const modelMap = {};
-  for (const r of filteredDaily) {
-    if (!modelMap[r.model]) modelMap[r.model] = { model: r.model, input: 0, output: 0, cache_read: 0, cache_creation: 0, turns: 0, sessions: 0 };
-    const m = modelMap[r.model];
-    m.input          += r.input;
-    m.output         += r.output;
-    m.cache_read     += r.cache_read;
-    m.cache_creation += r.cache_creation;
-    m.turns          += r.turns;
-  }
-
-  // Filter sessions by model + account + date range
-  const filteredSessions = rawData.sessions_all.filter(s =>
-    selectedModels.has(s.model) &&
-    selectedAccounts.has(s.account || 'default') &&
-    (!cutoff || s.last_date >= cutoff)
-  );
-
-  // Add session counts into modelMap
-  for (const s of filteredSessions) {
-    if (modelMap[s.model]) modelMap[s.model].sessions++;
-  }
-
-  const byModel = Object.values(modelMap).sort((a, b) => (b.input + b.output) - (a.input + a.output));
-
-  // By project: aggregate from filtered sessions
-  const projMap = {};
-  for (const s of filteredSessions) {
-    if (!projMap[s.project]) projMap[s.project] = { project: s.project, input: 0, output: 0, turns: 0 };
-    projMap[s.project].input  += s.input;
-    projMap[s.project].output += s.output;
-    projMap[s.project].turns  += s.turns;
-  }
-  const byProject = Object.values(projMap).sort((a, b) => (b.input + b.output) - (a.input + a.output));
-
-  // Totals
-  const totals = {
-    sessions:       filteredSessions.length,
-    turns:          byModel.reduce((s, m) => s + m.turns, 0),
-    input:          byModel.reduce((s, m) => s + m.input, 0),
-    output:         byModel.reduce((s, m) => s + m.output, 0),
-    cache_read:     byModel.reduce((s, m) => s + m.cache_read, 0),
-    cache_creation: byModel.reduce((s, m) => s + m.cache_creation, 0),
-    cost:           byModel.reduce((s, m) => s + calcCost(m.model, m.input, m.output, m.cache_read, m.cache_creation), 0),
-  };
-
-  // Update daily chart title
-  document.getElementById('daily-chart-title').textContent = 'Daily Token Usage \u2014 ' + RANGE_LABELS[selectedRange];
-  visibleSessions = filteredSessions.slice(0, 20);
-
-  renderStats(totals);
-  renderDailyChart(daily);
-  renderModelChart(byModel);
-  renderProjectChart(byProject);
-  renderSessionsTable(visibleSessions);
-  renderModelCostTable(byModel);
-}
-
-function rerenderSessionsOnly() {
-  if (!rawData) return;
-  renderSessionsTable(visibleSessions);
-}
-
-// ── Renderers ──────────────────────────────────────────────────────────────
-function renderStats(t) {
-  const rangeLabel = RANGE_LABELS[selectedRange].toLowerCase();
-  const stats = [
-    { label: 'Sessions',       value: t.sessions.toLocaleString(), sub: rangeLabel,             cls: '' },
-    { label: 'Turns',          value: fmt(t.turns),                sub: rangeLabel,             cls: '' },
-    { label: 'Input Tokens',   value: fmt(t.input),                sub: 'prompt tokens',        cls: 'stat-tokens' },
-    { label: 'Output Tokens',  value: fmt(t.output),               sub: 'generated tokens',     cls: 'stat-tokens' },
-    { label: 'Cache Read',     value: fmt(t.cache_read),           sub: 'from prompt cache',    cls: 'stat-cache' },
-    { label: 'Cache Creation', value: fmt(t.cache_creation),       sub: 'writes to cache',      cls: 'stat-cache' },
-    { label: 'Est. Cost',      value: fmtCostBig(t.cost),          sub: 'API pricing, Apr 2026',cls: 'stat-primary' },
-  ];
-  document.getElementById('stats-row').innerHTML = stats.map(s => `
-    <div class="stat-card ${s.cls}">
-      <div class="label">${s.label}</div>
-      <div class="value">${s.value}</div>
-      ${s.sub ? `<div class="sub">${s.sub}</div>` : ''}
-    </div>
-  `).join('');
-}
-
-function renderDailyChart(daily) {
-  const ctx = document.getElementById('chart-daily').getContext('2d');
-  if (charts.daily) charts.daily.destroy();
-  charts.daily = new Chart(ctx, {
-    type: 'bar',
-    data: {
-      labels: daily.map(d => d.day),
-      datasets: [
-        { label: 'Input',          data: daily.map(d => d.input),          backgroundColor: TOKEN_COLORS.input,          stack: 'tokens' },
-        { label: 'Output',         data: daily.map(d => d.output),         backgroundColor: TOKEN_COLORS.output,         stack: 'tokens' },
-        { label: 'Cache Read',     data: daily.map(d => d.cache_read),     backgroundColor: TOKEN_COLORS.cache_read,     stack: 'tokens' },
-        { label: 'Cache Creation', data: daily.map(d => d.cache_creation), backgroundColor: TOKEN_COLORS.cache_creation, stack: 'tokens' },
-      ]
-    },
-    options: {
-      responsive: true, maintainAspectRatio: false,
-      plugins: { legend: { labels: { color: '#8892a4', boxWidth: 12 } } },
-      scales: {
-        x: { ticks: { color: '#8892a4', maxTicksLimit: RANGE_TICKS[selectedRange] }, grid: { color: '#2a2d3a' } },
-        y: { ticks: { color: '#8892a4', callback: v => fmt(v) }, grid: { color: '#2a2d3a' } },
-      }
-    }
-  });
-}
-
-function renderModelChart(byModel) {
-  const ctx = document.getElementById('chart-model').getContext('2d');
-  if (charts.model) charts.model.destroy();
-  if (!byModel.length) { charts.model = null; return; }
-  charts.model = new Chart(ctx, {
-    type: 'doughnut',
-    data: {
-      labels: byModel.map(m => m.model),
-      datasets: [{ data: byModel.map(m => m.input + m.output), backgroundColor: MODEL_COLORS, borderWidth: 2, borderColor: '#1a1d27' }]
-    },
-    options: {
-      responsive: true, maintainAspectRatio: false,
-      plugins: {
-        legend: { position: 'bottom', labels: { color: '#8892a4', boxWidth: 12, font: { size: 11 } } },
-        tooltip: { callbacks: { label: ctx => ` ${ctx.label}: ${fmt(ctx.raw)} tokens` } }
-      }
-    }
-  });
-}
-
-function renderProjectChart(byProject) {
-  const top = byProject.slice(0, 10);
-  const ctx = document.getElementById('chart-project').getContext('2d');
-  if (charts.project) charts.project.destroy();
-  if (!top.length) { charts.project = null; return; }
-  charts.project = new Chart(ctx, {
-    type: 'bar',
-    data: {
-      labels: top.map(p => p.project.length > 22 ? '\u2026' + p.project.slice(-20) : p.project),
-      datasets: [
-        { label: 'Input',  data: top.map(p => p.input),  backgroundColor: TOKEN_COLORS.input },
-        { label: 'Output', data: top.map(p => p.output), backgroundColor: TOKEN_COLORS.output },
-      ]
-    },
-    options: {
-      indexAxis: 'y', responsive: true, maintainAspectRatio: false,
-      plugins: { legend: { labels: { color: '#8892a4', boxWidth: 12 } } },
-      scales: {
-        x: { ticks: { color: '#8892a4', callback: v => fmt(v) }, grid: { color: '#2a2d3a' } },
-        y: { ticks: { color: '#8892a4', font: { size: 11 } }, grid: { color: '#2a2d3a' } },
-      }
-    }
-  });
-}
-
-function renderSessionsTable(sessions) {
-  document.getElementById('sessions-body').innerHTML = sessions.map(s => {
-    const cost = calcCost(s.model, s.input, s.output, s.cache_read, s.cache_creation);
-    const costCell = isBillable(s.model)
-      ? `<td class="cost">${fmtCost(cost)}</td>`
-      : `<td class="cost-na">n/a</td>`;
-    const isActive = s.session_id === activeSessionId;
-    const showPreview = hoverPreviewSessionId === s.session_id;
-    return `<tr class="session-row-hover ${isActive ? 'active' : ''}" onclick="openSessionDetail('${s.session_id}')" onmouseenter="scheduleSessionPreview('${s.session_id}')" onmouseleave="hideSessionPreview()">
-      <td>
-        <div class="session-link">
-          <div class="session-link-id">${s.session_short}&hellip;</div>
-          <div class="session-link-meta">Open transcript</div>
-          ${showPreview ? renderSessionHoverCard() : ''}
-        </div>
-      </td>
-      <td>${s.project}</td>
-      <td><span class="account-tag" style="color:${accountColor(s.account)}">${s.account || 'default'}</span></td>
-      <td class="muted">${s.last}</td>
-      <td class="muted">${s.duration_min}m</td>
-      <td><span class="model-tag">${s.model}</span></td>
-      <td class="num">${s.turns}</td>
-      <td class="num">${fmt(s.input)}</td>
-      <td class="num">${fmt(s.output)}</td>
-      ${costCell}
-    </tr>`;
-  }).join('');
-}
-
-function escapeHTML(value) {
-  return String(value ?? '')
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;');
-}
-
-function renderSessionHoverCard() {
-  if (!hoverPreviewSessionId) return '';
-  if (!hoverPreviewData) {
-    return `<div class="session-hover-card">
-      <div class="session-hover-kicker">Session Preview</div>
-      <div class="session-hover-body">Loading summary…</div>
-    </div>`;
-  }
-  if (hoverPreviewData.error) {
-    return `<div class="session-hover-card">
-      <div class="session-hover-kicker">Session Preview</div>
-      <div class="session-hover-body">${escapeHTML(hoverPreviewData.error)}</div>
-    </div>`;
-  }
-  const preview = hoverPreviewData;
-  const pills = [
-    preview.project ? `Project ${preview.project}` : '',
-    preview.model ? `Model ${preview.model}` : '',
-    preview.message_count ? `${preview.message_count} messages` : '',
-    preview.token_total ? `${fmt(preview.token_total)} tokens` : '',
-  ].filter(Boolean).map(item => `<div class="session-hover-pill">${escapeHTML(item)}</div>`).join('');
-  return `<div class="session-hover-card">
-    <div class="session-hover-kicker">Session Preview</div>
-    <div class="session-hover-title">${escapeHTML(preview.first_user_excerpt || `Session ${preview.session_short}…`)}</div>
-    <div class="session-hover-meta">${pills}</div>
-    <div class="session-hover-body">Hover to scan intent. Click to open the full transcript.</div>
-  </div>`;
-}
-
-function scheduleSessionPreview(sessionId) {
-  clearTimeout(hoverPreviewTimer);
-  hoverPreviewSessionId = sessionId;
-  hoverPreviewData = previewCache.get(sessionId) || null;
-  rerenderSessionsOnly();
-  if (previewCache.has(sessionId)) return;
-  hoverPreviewTimer = setTimeout(() => loadSessionPreview(sessionId), 180);
-}
-
-function hideSessionPreview() {
-  clearTimeout(hoverPreviewTimer);
-  hoverPreviewSessionId = null;
-  hoverPreviewData = null;
-  rerenderSessionsOnly();
-}
-
-async function loadSessionPreview(sessionId) {
-  if (previewCache.has(sessionId)) {
-    hoverPreviewData = previewCache.get(sessionId);
-    rerenderSessionsOnly();
-    return;
-  }
-  try {
-    const resp = await fetch('/api/session_preview?session_id=' + encodeURIComponent(sessionId));
-    const data = await resp.json();
-    previewCache.set(sessionId, data);
-    if (hoverPreviewSessionId === sessionId) {
-      hoverPreviewData = data;
-      rerenderSessionsOnly();
-    }
-  } catch (e) {
-    const errorData = { error: 'Failed to load summary.' };
-    previewCache.set(sessionId, errorData);
-    if (hoverPreviewSessionId === sessionId) {
-      hoverPreviewData = errorData;
-      rerenderSessionsOnly();
-    }
-  }
-}
-
-function renderSessionDetailLoading() {
-  document.getElementById('session-modal-title').textContent = 'Session Context';
-  document.getElementById('session-modal-subtitle').textContent = 'Loading transcript…';
-  document.getElementById('session-detail').innerHTML = '<div class="session-detail-empty">Loading session context…</div>';
-  document.getElementById('session-modal-backdrop').classList.add('open');
-  document.body.style.overflow = 'hidden';
-}
-
-function renderSessionDetailError(message) {
-  document.getElementById('session-modal-title').textContent = 'Session Context';
-  document.getElementById('session-modal-subtitle').textContent = 'There was a problem loading this transcript.';
-  document.getElementById('session-detail').innerHTML = `<div class="session-detail-error">${escapeHTML(message)}</div>`;
-  document.getElementById('session-modal-backdrop').classList.add('open');
-  document.body.style.overflow = 'hidden';
-}
-
-function closeSessionDetail() {
-  activeSessionId = null;
-  updateURL();
-  applyFilter();
-  document.getElementById('session-modal-backdrop').classList.remove('open');
-  document.body.style.overflow = '';
-  document.getElementById('session-modal-title').textContent = 'Session Context';
-  document.getElementById('session-modal-subtitle').textContent = 'Open a session from the table to inspect its transcript.';
-  document.getElementById('session-detail').innerHTML = '<div class="session-detail-empty">Click a session row to inspect the transcript context from its source `.jsonl` file.</div>';
-}
-
-function onSessionModalBackdrop(event) {
-  if (event.target.id === 'session-modal-backdrop') closeSessionDetail();
-}
-
-function humanizeActivity(text) {
-  if (text.startsWith('[tool_use]')) return { label: 'Tool Call', body: text.replace('[tool_use]', '').trim() };
-  if (text.startsWith('[tool_result]')) return { label: 'Tool Result', body: text.replace('[tool_result]', '').trim() };
-  return null;
-}
-
-function summarizeSessionTitle(summary, meta) {
-  const text = (summary.first_user_excerpt || '').trim();
-  if (!text) return meta.project || `Session ${meta.session_short}`;
-  return text.length > 72 ? text.slice(0, 72).trimEnd() + '…' : text;
-}
-
-function formatSessionDate(value) {
-  if (!value) return 'Unknown';
-  return value.replace('T', ' ').replace('Z', '').slice(0, 16);
-}
-
-function renderSessionDetail(data) {
-  const meta = data.session;
-  const summary = data.summary || {};
-  const sessionTitle = summarizeSessionTitle(summary, meta);
-  const messageHTML = data.messages.map(msg => {
-    const activity = humanizeActivity(msg.content);
-    const tokenParts = [];
-    if (msg.role === 'assistant') {
-      tokenParts.push(`in ${fmt(msg.input_tokens)}`);
-      tokenParts.push(`out ${fmt(msg.output_tokens)}`);
-      if (msg.cache_read_tokens) tokenParts.push(`cache read ${fmt(msg.cache_read_tokens)}`);
-      if (msg.cache_creation_tokens) tokenParts.push(`cache write ${fmt(msg.cache_creation_tokens)}`);
-    }
-    if (activity) {
-      return `<div class="message-activity-group">
-        <div class="message-activity">
-          <div class="message-activity-label">${escapeHTML(activity.label)}</div>
-          <div class="message-activity-body">${escapeHTML(activity.body)}</div>
-        </div>
-      </div>`;
-    }
-    return `<div class="message-card ${msg.role}">
-      <div class="message-head">
-        <div class="message-role">${msg.role}${msg.model ? ' · ' + escapeHTML(msg.model) : ''}</div>
-        <div class="message-meta">${escapeHTML((msg.timestamp || '').replace('T', ' ').slice(0, 19))}${tokenParts.length ? ' · ' + escapeHTML(tokenParts.join(' · ')) : ''}</div>
-      </div>
-      <div class="message-body">${escapeHTML(msg.content)}</div>
-    </div>`;
-  }).join('');
-
-  const metaPills = [
-    meta.project ? `Project: ${meta.project}` : '',
-    meta.git_branch ? `Branch: ${meta.git_branch}` : '',
-    summary.message_count ? `Messages: ${summary.message_count}` : '',
-    summary.assistant_count ? `Assistant replies: ${summary.assistant_count}` : '',
-    meta.source_file ? `File: ${meta.source_file}` : '',
-  ].filter(Boolean).map(item => `<div class="session-detail-pill">${escapeHTML(item)}</div>`).join('');
-
-  const assistantMessages = data.messages.filter(msg => msg.role === 'assistant');
-  const primaryModel = assistantMessages.find(msg => msg.model)?.model || 'unknown';
-  const totalInput = assistantMessages.reduce((sum, msg) => sum + (msg.input_tokens || 0), 0);
-  const totalOutput = assistantMessages.reduce((sum, msg) => sum + (msg.output_tokens || 0), 0);
-  const totalCacheRead = assistantMessages.reduce((sum, msg) => sum + (msg.cache_read_tokens || 0), 0);
-  const totalCacheCreation = assistantMessages.reduce((sum, msg) => sum + (msg.cache_creation_tokens || 0), 0);
-  const estimatedCost = isBillable(primaryModel)
-    ? fmtCost(calcCost(primaryModel, totalInput, totalOutput, totalCacheRead, totalCacheCreation))
-    : 'n/a';
-  const overviewCards = [
-    { label: 'Project', value: meta.project || 'Unknown', sub: meta.git_branch ? `Branch ${meta.git_branch}` : 'No branch captured' },
-    { label: 'Timeline', value: formatSessionDate(meta.last_timestamp), sub: `Started ${formatSessionDate(meta.first_timestamp)}` },
-    { label: 'Model', value: primaryModel, sub: `${summary.assistant_count || 0} assistant replies` },
-    { label: 'Usage', value: `${fmt(totalInput + totalOutput)} tokens`, sub: `Cost ${estimatedCost}` },
-  ].map(card => `
-    <div class="session-overview-card">
-      <div class="session-overview-label">${escapeHTML(card.label)}</div>
-      <div class="session-overview-value">${escapeHTML(card.value)}</div>
-      <div class="session-overview-sub">${escapeHTML(card.sub)}</div>
-    </div>
-  `).join('');
-
-  document.getElementById('session-modal-title').textContent = sessionTitle;
-  document.getElementById('session-modal-subtitle').textContent = `Session ${meta.session_short}…`;
-  document.getElementById('session-detail').innerHTML = `
-    <div class="session-hero">
-      <div class="session-kicker">Conversation Focus</div>
-      <div class="session-hero-title">${escapeHTML(sessionTitle)}</div>
-      <div class="session-hero-text">${summary.first_user_excerpt ? escapeHTML(summary.first_user_excerpt) : 'No user prompt text available for this session.'}</div>
-    </div>
-    <div class="session-overview">${overviewCards}</div>
-    <div class="session-summary">
-      <div class="session-summary-card">
-        <div class="session-summary-label">Session Metadata</div>
-        <div class="session-detail-meta">${metaPills}</div>
-      </div>
-      <div class="session-summary-card">
-        <div class="session-summary-label">Reading Note</div>
-        <div class="session-summary-text">User and assistant messages are shown as the main conversation. Tool calls and tool results are separated so the session reads more like a narrative than a raw log.</div>
-      </div>
-    </div>
-    <div class="transcript-section-title">Transcript</div>
-    <div class="message-list">${messageHTML}</div>
-  `;
-  document.getElementById('session-modal-backdrop').classList.add('open');
-  document.body.style.overflow = 'hidden';
-}
-
-async function openSessionDetail(sessionId) {
-  activeSessionId = sessionId;
-  updateURL();
-  applyFilter();
-  renderSessionDetailLoading();
-  try {
-    const resp = await fetch('/api/session?session_id=' + encodeURIComponent(sessionId));
-    const data = await resp.json();
-    if (data.error) {
-      renderSessionDetailError(data.error);
-      return;
-    }
-    renderSessionDetail(data);
-  } catch (e) {
-    console.error(e);
-    renderSessionDetailError('Failed to load session context.');
-  }
-}
-
-function renderModelCostTable(byModel) {
-  document.getElementById('model-cost-body').innerHTML = byModel.map(m => {
-    const cost = calcCost(m.model, m.input, m.output, m.cache_read, m.cache_creation);
-    const costCell = isBillable(m.model)
-      ? `<td class="cost">${fmtCost(cost)}</td>`
-      : `<td class="cost-na">n/a</td>`;
-    return `<tr>
-      <td><span class="model-tag">${m.model}</span></td>
-      <td class="num">${fmt(m.turns)}</td>
-      <td class="num">${fmt(m.input)}</td>
-      <td class="num">${fmt(m.output)}</td>
-      <td class="num">${fmt(m.cache_read)}</td>
-      <td class="num">${fmt(m.cache_creation)}</td>
-      ${costCell}
-    </tr>`;
-  }).join('');
-}
-
-// ── Data loading ───────────────────────────────────────────────────────────
-async function loadData() {
-  try {
-    const resp = await fetch('/api/data');
-    const d = await resp.json();
-    if (d.error) {
-      document.body.innerHTML = '<div style="padding:40px;color:#f87171">' + d.error + '</div>';
-      return;
-    }
-    document.getElementById('meta').textContent = 'Updated: ' + d.generated_at + ' \u00b7 Auto-refresh in 30s';
-
-    const isFirstLoad = rawData === null;
-    rawData = d;
-
-    if (isFirstLoad) {
-      // Restore range from URL, mark active button
-      selectedRange = readURLRange();
-      activeSessionId = readURLSession();
-      document.querySelectorAll('.range-btn').forEach(btn =>
-        btn.classList.toggle('active', btn.dataset.range === selectedRange)
-      );
-      // Build profile selector
-      buildProfileUI(d.all_accounts || []);
-      // Build model filter (reads URL for model selection too)
-      buildFilterUI(d.all_models);
-    }
-
-    applyFilter();
-    if (isFirstLoad && activeSessionId) openSessionDetail(activeSessionId);
-  } catch(e) {
-    console.error(e);
-  }
-}
-
-loadData();
-setInterval(loadData, 30000);
-document.addEventListener('keydown', event => {
-  if (event.key === 'Escape' && activeSessionId) closeSessionDetail();
-});
-</script>
-</body>
-</html>
-"""
-
-
 class DashboardHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
@@ -1320,14 +237,23 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
 
-        if parsed.path in ("/", "/index.html"):
+        if parsed.path in STATIC:
+            name, content_type = STATIC[parsed.path]
+            body = (WEB_DIR / name).read_bytes()
             self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
-            self.wfile.write(HTML_TEMPLATE.encode("utf-8"))
+            self.wfile.write(body)
 
         elif parsed.path == "/api/data":
-            data = get_dashboard_data()
+            params = parse_qs(parsed.query)
+            filters = {key: params[key][0] for key in ('start', 'end', 'source', 'account', 'project')
+                       if params.get(key, [''])[0]}
+            if params.get('models', [''])[0]:
+                filters['models'] = params['models'][0].split(',')
+            data = get_dashboard_data(**filters)
             body = json.dumps(data).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -1364,6 +290,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
         else:
             self.send_response(404)
             self.end_headers()
+
+    def do_POST(self):
+        if urlparse(self.path).path != "/api/scan":
+            self.send_response(404)
+            self.end_headers()
+            return
+        try:
+            body, status = json.dumps(run_scan()).encode("utf-8"), 200
+        except Exception as exc:  # report the failure to the page instead of dropping the connection
+            body, status = json.dumps({"error": str(exc)}).encode("utf-8"), 500
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
 
 def serve(port=8080):

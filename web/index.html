@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>usage.</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=DM+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+<script src="app.js" defer></script>
+</head>
+<body>
+<header class="top pad">
+  <div class="brand">usage.</div>
+  <nav class="filters" aria-label="Filters">
+    <div class="fgroup"><span class="eyebrow">Period</span><div class="seg" id="range-seg"></div></div>
+    <div class="fgroup"><span class="eyebrow">Tool</span><div class="seg" id="tool-seg"></div></div>
+    <div class="fgroup" id="account-group"><span class="eyebrow">Account</span><div class="seg" id="account-seg"></div></div>
+    <div class="fgroup">
+      <details class="dropdown" id="model-filter">
+        <summary class="pill" id="model-summary">All models</summary>
+        <div class="dropdown-panel">
+          <div class="dropdown-actions">
+            <button type="button" class="pill" id="models-all">All</button>
+            <button type="button" class="pill" id="models-none">None</button>
+          </div>
+          <div id="model-list"></div>
+        </div>
+      </details>
+    </div>
+  </nav>
+  <div class="right">
+    <span class="eyebrow" id="updated"></span>
+    <div class="seg" id="theme-seg"><button type="button" data-theme="light">Light</button><button type="button" data-theme="dark">Dark</button></div>
+    <button type="button" class="pill solid" id="rescan">Scan now</button>
+  </div>
+</header>
+
+<div class="active pad" id="active" hidden></div>
+<p class="notice pad" id="notice" hidden></p>
+
+<main id="content">
+  <section class="hero">
+    <div class="hero-main pad">
+      <div class="eyebrow" id="h-eyebrow">01 — Spend</div>
+      <div class="hero-number display" id="h-number">—</div>
+      <div class="delta" id="h-delta"></div>
+      <p class="note" id="h-note"></p>
+    </div>
+    <div class="kpis" id="kpis"></div>
+  </section>
+
+  <section class="row two">
+    <div class="cell pad">
+      <div class="cell-head"><span class="eyebrow">02 — Daily spend</span><div class="legend" id="legend"></div></div>
+      <svg id="chart" role="img" aria-label="Daily spend by tool"></svg>
+      <details class="table-view">
+        <summary class="eyebrow">Show as table</summary>
+        <div class="scroll"><table id="daily-table"></table></div>
+      </details>
+    </div>
+    <div class="cell pad">
+      <div class="cell-head"><span class="eyebrow">03 — By tool</span></div>
+      <div id="tools"></div>
+      <div class="eyebrow sub-head">By account</div>
+      <div class="list" id="accounts-list"></div>
+    </div>
+  </section>
+
+  <section class="row three">
+    <div class="cell pad"><div class="cell-head"><span class="eyebrow">04 — Projects</span><span class="hint" id="projects-hint"></span></div><div class="list" id="projects"></div></div>
+    <div class="cell pad"><div class="cell-head"><span class="eyebrow">05 — Models</span><span class="hint" id="models-hint"></span></div><div class="list" id="models"></div></div>
+    <div class="cell pad"><div class="cell-head"><span class="eyebrow">06 — Where the money goes</span><span class="hint" id="parts-hint"></span></div><div class="list" id="parts"></div></div>
+  </section>
+
+  <section class="pad sessions-section">
+    <div class="cell-head"><span class="eyebrow" id="sessions-title">07 — Sessions</span><div class="seg" id="sort-seg"></div></div>
+    <div class="scroll">
+      <table class="sessions">
+        <thead><tr><th>Project</th><th>Tool</th><th class="hide-narrow">Model</th><th class="hide-narrow">Last active</th><th class="num hide-narrow">Duration</th><th class="num">Responses</th><th class="num">Tokens</th><th class="hide-narrow">Share</th><th class="num">Cost</th></tr></thead>
+        <tbody id="sessions"></tbody>
+      </table>
+    </div>
+    <button type="button" class="pill more" id="session-more" hidden>Show more</button>
+    <div class="foot"><span>API-equivalent value of the usage, not what was billed. Prices: <code>prices.json</code>. Days are local calendar days.</span><span class="mono" id="foot-right"></span></div>
+  </section>
+</main>
+
+<div class="tip" id="tip"></div>
+
+<dialog id="session-dialog">
+  <div class="dialog-head">
+    <div><div class="eyebrow" id="dialog-sub"></div><h2 class="display" id="dialog-title">Session</h2></div>
+    <button type="button" class="pill" id="dialog-close">Close</button>
+  </div>
+  <div id="dialog-body"></div>
+</dialog>
+</body>
+</html>
