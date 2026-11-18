@@ -7,7 +7,9 @@
 
 Claude Code writes detailed usage logs locally — token counts, models, sessions, projects — regardless of your plan. This dashboard reads those logs and turns them into charts and cost estimates. Works on API, Pro, and Max plans.
 
-![Claude Usage Dashboard](docs/screenshot.png)
+![The dashboard: period spend, daily spend by tool, and spend by tool, account, project and model](docs/screenshot.png)
+
+<sub>Screenshot made with invented data.</sub>
 
 **Created by:** [The Product Compass Newsletter](https://www.productcompass.pm)
 
