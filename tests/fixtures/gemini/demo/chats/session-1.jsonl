@@ -1,0 +1,6 @@
+{"sessionId": "gm-1", "projectHash": "x", "startTime": "2026-10-07T12:00:00Z", "lastUpdated": "2026-10-07T12:05:00Z", "kind": "main"}
+{"$set": {"lastUpdated": "2026-10-07T12:01:00Z"}}
+{"id": "u1", "type": "user", "timestamp": "2026-10-07T12:00:00Z", "content": "synthetic prompt"}
+{"id": "g1", "type": "gemini", "timestamp": "2026-10-07T12:00:05Z", "model": "gemini-3-flash-preview", "tokens": {"input": 1000, "output": 40, "cached": 600, "thoughts": 10, "tool": 0, "total": 1050}}
+{"id": "g1", "type": "gemini", "timestamp": "2026-10-07T12:00:06Z", "model": "gemini-3-flash-preview", "tokens": {"input": 1000, "output": 60, "cached": 600, "thoughts": 10, "tool": 0, "total": 1070}, "toolCalls": []}
+{"id": "g2", "type": "gemini", "timestamp": "2026-10-07T12:01:00Z", "model": "gemini-3-flash-preview", "tokens": {"input": 2000, "output": 80, "cached": 0, "thoughts": 0, "tool": 0, "total": 2080}}
